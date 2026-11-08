@@ -1,0 +1,23 @@
+diff --git a/src/recompilation.cpp b/src/recompilation.cpp
+index c228433..8abd18d 100644
+--- a/src/recompilation.cpp
++++ b/src/recompilation.cpp
+@@ -36,7 +36,18 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
+     bool exact_match_found = false;
+ 
+     // Use a thread local to prevent reallocation across runs and to allow multi-threading in the future.
++#if defined(__PROSPERO__)
++    // PS5: a thread_local whose destructor frees memory crashes when its thread ends (the free goes to a
++    // per-thread heap arena that is already gone; the mod loading thread ends as soon as the game starts).
++    // Each thread keeps a pointer instead, which has no destructor; the vector is never freed.
++    thread_local std::vector<size_t>* matched_funcs_ptr = nullptr;
++    if (matched_funcs_ptr == nullptr) {
++        matched_funcs_ptr = new std::vector<size_t>{};
++    }
++    std::vector<size_t>& matched_funcs = *matched_funcs_ptr;
++#else
+     thread_local std::vector<size_t> matched_funcs{};
++#endif
+     matched_funcs.clear();
+ 
+     // Evaluate any functions with the target address to see if they're potential candidates for JAL resolution.

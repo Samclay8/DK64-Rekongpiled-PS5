@@ -1,0 +1,23 @@
+# Upstream checkout, Mihawk's driver checkouts and everything built from them
+/src-upstream/
+/radv/
+/build*/
+/.deps/
+/dist/
+# ROMs and anything derived from them
+*.n64
+*.z64
+*.v64
+# Local downloads, not part of the port
+/downloads/
+# Local tool state and logs
+/.home/
+/logs/
+# Decision log stays local (as in stk-ps5)
+/docs/decision-log.md
+# Home screen background and splash, made from assets/background-source.webp (8 MB each)
+/sce_sys/pic*.dds
+# Python venv for the art tools (tools/make-art.py, tools/make-backgrounds.py)
+/.venv/
+# Windows download markers
+*:Zone.Identifier

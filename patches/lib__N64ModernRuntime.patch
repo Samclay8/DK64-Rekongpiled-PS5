@@ -1,0 +1,690 @@
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index 37556bd..bd5e3f9 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -345,6 +345,18 @@ namespace recomp {
+             void close_mods();
+             void load_mods_config();
+             void enable_mod(const std::string& mod_id, bool enabled, bool trigger_save);
++            // Mods that can't be switched while the game runs (code mods): switches made in the menu are kept
++            // as pending changes for the next start. Nothing changes in the running game; applying them writes
++            // mods.json at once, discarding them forgets them.
++            void set_next_start_change(const std::string& mod_id, bool enabled);
++            bool get_next_start_change(const std::string& mod_id, bool& enabled) const;
++            size_t count_next_start_changes() const;
++            void apply_next_start_changes();
++            void discard_next_start_changes();
++            // The next start as the menu shows it: the enabled mods with the pending changes applied, and the mods
++            // those need (non-optional dependencies, followed through), which load whether switched on or not.
++            bool is_mod_enabled_next_start(const std::string& mod_id);
++            bool is_mod_required_next_start(const std::string& mod_id);
+             bool is_mod_enabled(const std::string& mod_id) const;
+             bool is_mod_auto_enabled(const std::string& mod_id) const;
+             bool is_mod_deprecated(const std::string& mod_id, const Version& mod_version) const;
+@@ -443,6 +455,8 @@ namespace recomp {
+             ModContentTypeId rom_patch_content_type_id;
+             size_t active_game = (size_t)-1;
+             std::string latest_game_mode;
++            // Mod id -> enabled, for switches that apply on the next start (set_next_start_change).
++            std::unordered_map<std::string, bool> next_start_changes;
+         };
+ 
+         class ModCodeHandle {
+@@ -632,6 +646,13 @@ namespace recomp {
+         recomp::Version get_mod_version(size_t mod_index);
+         std::string get_mod_id(size_t mod_index);
+         void enable_mod(const std::string& mod_id, bool enabled);
++        void set_next_start_change(const std::string& mod_id, bool enabled);
++        bool get_next_start_change(const std::string& mod_id, bool& enabled);
++        size_t count_next_start_changes();
++        void apply_next_start_changes();
++        void discard_next_start_changes();
++        bool is_mod_enabled_next_start(const std::string& mod_id);
++        bool is_mod_required_next_start(const std::string& mod_id);
+         bool is_mod_enabled(const std::string& mod_id);
+         bool is_mod_auto_enabled(const std::string& mod_id);
+         bool is_mod_deprecated(const std::string& mod_id, const Version& mod_version);
+diff --git a/librecomp/src/mod_events.cpp b/librecomp/src/mod_events.cpp
+index 7dfc9df..368d8f0 100644
+--- a/librecomp/src/mod_events.cpp
++++ b/librecomp/src/mod_events.cpp
+@@ -30,6 +30,17 @@ extern "C" void recomp_trigger_event(uint8_t* rdram, recomp_context* ctx, uint32
+         ULTRAMODERN_QUICK_EXIT();
+     }
+ 
++#if defined(__PROSPERO__)
++    {
++        // The first time the game runs mod code through an event, written out at once.
++        static bool reported = false;
++        if (!reported && !event_callbacks[event_index].empty()) {
++            reported = true;
++            fprintf(stderr, "[mods] first mod event (index %u, %zu callbacks)\n", event_index, event_callbacks[event_index].size());
++            fflush(stderr);
++        }
++    }
++#endif
+     // Copy the initial context state to restore it after running each callback.
+     recomp_context initial_context = *ctx;
+ 
+diff --git a/librecomp/src/mod_hooks.cpp b/librecomp/src/mod_hooks.cpp
+index 596b6e8..0186012 100644
+--- a/librecomp/src/mod_hooks.cpp
++++ b/librecomp/src/mod_hooks.cpp
+@@ -23,7 +23,21 @@ std::vector<HookTableEntry> hook_table{};
+ 
+ // Holds the recomp context to restore after running each hook. This is a vector because a hook may end up calling another hooked function,
+ // so this acts as a stack of contexts to handle that recursion.
++#if defined(__PROSPERO__)
++// PS5: a thread_local whose destructor frees memory crashes when its thread ends (the free goes to a
++// per-thread heap arena that is already gone). Each thread keeps a pointer instead, which has no
++// destructor; the vector is never freed.
++static thread_local std::vector<recomp_context>* hook_contexts_ptr = nullptr;
++static std::vector<recomp_context>& get_hook_contexts() {
++    if (hook_contexts_ptr == nullptr) {
++        hook_contexts_ptr = new std::vector<recomp_context>{ recomp_context{} };
++    }
++    return *hook_contexts_ptr;
++}
++#define hook_contexts (get_hook_contexts())
++#else
+ thread_local std::vector<recomp_context> hook_contexts = { recomp_context{} };
++#endif
+ 
+ void recomp::mods::run_hook(uint8_t* rdram, recomp_context* ctx, size_t hook_slot_index) {
+     // Sanity check the hook slot index.
+@@ -34,6 +48,17 @@ void recomp::mods::run_hook(uint8_t* rdram, recomp_context* ctx, size_t hook_slo
+         ULTRAMODERN_QUICK_EXIT();
+     }
+ 
++#if defined(__PROSPERO__)
++    {
++        // The first time the game runs mod code through a hook, written out at once.
++        static bool reported = false;
++        if (!reported) {
++            reported = true;
++            fprintf(stderr, "[mods] first mod hook (slot %zu, %zu hooks)\n", hook_slot_index, hook_table[hook_slot_index].hooks.size());
++            fflush(stderr);
++        }
++    }
++#endif
+     // Copy the initial context state to restore it after running each callback.
+     hook_contexts.emplace_back(*ctx);
+ 
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
+index 0f7de83..686ec94 100644
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -11,6 +11,11 @@
+ #include "recompiler/context.h"
+ #include "recompiler/live_recompiler.h"
+ 
++#if defined(__PROSPERO__)
++#include <cstdio>
++#include <ps5platform/kernel.h>
++#endif
++
+ static bool read_json(std::ifstream input_file, nlohmann::json &json_out) {
+     if (!input_file.good()) {
+         return false;
+@@ -227,6 +232,56 @@ private:
+     uint32_t api_version;
+ };
+ 
++#if defined(__PROSPERO__)
++// PS5: the console's pages are 16 KiB, and the jump written into a function (up to 16 bytes) can cross
++// into the next page. The pages stay executable while they're rewritten, so code elsewhere on them that
++// other threads are running keeps running. old_flags is 1 when the pages were made writable; when the
++// console refuses, the refusal is logged and patch_func leaves the function alone instead of faulting.
++static void ps5_patch_range(void* target_func, uintptr_t* start, size_t* length) {
++    constexpr uintptr_t page_size = 16 * 1024;
++    const uintptr_t first = (uintptr_t)target_func & ~(page_size - 1);
++    const uintptr_t last = ((uintptr_t)target_func + 16 + page_size - 1) & ~(page_size - 1);
++    *start = first;
++    *length = size_t(last - first);
++}
++
++void unprotect(void* target_func, uint64_t* old_flags) {
++    uintptr_t start;
++    size_t length;
++    ps5_patch_range(target_func, &start, &length);
++    static int attempts = 0;
++    if (attempts++ < 3) {
++        // Written out before the call: if the console ends the process for it, this is the log's last line.
++        fprintf(stderr, "[mods] making game code writable at %p (%zu bytes)\n", (void*)start, length);
++        fflush(stderr);
++    }
++    const int32_t result = sceKernelMprotect((void*)start, length,
++        PS5_KERNEL_PROT_CPU_READ | PS5_KERNEL_PROT_CPU_WRITE | PS5_KERNEL_PROT_CPU_EXEC);
++    *old_flags = (result == 0) ? 1 : 0;
++    if (result != 0) {
++        fprintf(stderr, "[mods] game code at %p can't be made writable (0x%08X): function not patched\n", target_func, (unsigned)result);
++        fflush(stderr);
++    }
++    else {
++        static bool reported = false;
++        if (!reported) {
++            reported = true;
++            fprintf(stderr, "[mods] game code is writable: patching functions for mods\n");
++            fflush(stderr);
++        }
++    }
++}
++
++void protect(void* target_func, uint64_t old_flags) {
++    if (old_flags == 0) {
++        return;
++    }
++    uintptr_t start;
++    size_t length;
++    ps5_patch_range(target_func, &start, &length);
++    sceKernelMprotect((void*)start, length, PS5_KERNEL_PROT_CPU_READ | PS5_KERNEL_PROT_CPU_EXEC);
++}
++#else
+ void unprotect(void* target_func, uint64_t* old_flags) {
+     // Align the address to a page boundary.
+     uintptr_t page_start = (uintptr_t)target_func;
+@@ -248,6 +303,7 @@ void protect(void* target_func, uint64_t old_flags) {
+     (void)result;
+ }
+ #endif
++#endif
+ 
+ namespace modpaths {
+     constexpr std::string_view default_mod_extension = "nrm";
+@@ -504,6 +560,11 @@ recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
+         .original_section_indices = std::move(original_section_indices)
+     };
+ 
++#if defined(__PROSPERO__)
++    // Each step written out at once, so a start that ends here shows how far it got.
++    fprintf(stderr, "[mods] compiling %zu functions%s\n", context.functions.size(), regenerated ? " (game functions with hooks)" : "");
++    fflush(stderr);
++#endif
+     N64Recomp::LiveGenerator generator{ context.functions.size(), recompiler_inputs };
+     std::vector<std::vector<uint32_t>> dummy_static_funcs{};
+ 
+@@ -521,6 +582,10 @@ recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
+     // Generate the code.
+     recompiler_output = std::make_unique<N64Recomp::LiveGeneratorOutput>(generator.finish());
+     is_good = !errored && recompiler_output->good;
++#if defined(__PROSPERO__)
++    fprintf(stderr, "[mods] compiled: %s\n", is_good ? "ok" : (errored ? "a function failed to recompile" : "code generation failed"));
++    fflush(stderr);
++#endif
+ }
+ 
+ void recomp::mods::LiveRecompilerCodeHandle::set_imported_function(size_t import_index, GenericFunction func) {
+@@ -566,6 +631,11 @@ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replac
+ 
+     uint64_t old_flags;
+     unprotect(target_func_u8, &old_flags);
++#if defined(__PROSPERO__)
++    if (old_flags == 0) {
++        return;
++    }
++#endif
+ 
+ #if defined(IS_X86_64)
+     static const uint8_t movabs_rax[] = {0x48, 0xB8};
+@@ -593,10 +663,18 @@ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replac
+ }
+ 
+ void unpatch_func(void* target_func, const recomp::mods::PatchData& data) {
++#if defined(__PROSPERO__)
++    // The original bytes were never read on the PS5 (execute-only code), so there is nothing to restore;
++    // mods change only when the game starts again.
++    (void)target_func;
++    (void)data;
++    return;
++#else
+     uint64_t old_flags;
+     unprotect(target_func, &old_flags);
+     memcpy(target_func, data.replaced_bytes.data(), data.replaced_bytes.size());
+     protect(target_func, old_flags);
++#endif
+ }
+ 
+ void recomp::mods::ModContext::add_opened_mod(ModManifest&& manifest, config::Config&& config, std::vector<size_t>&& game_indices, std::vector<ModContentTypeId>&& detected_content_types, std::vector<char>&& thumbnail) {
+@@ -1152,6 +1230,112 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
+     }
+ }
+ 
++void recomp::mods::ModContext::set_next_start_change(const std::string& mod_id, bool enabled) {
++    std::unique_lock lock(opened_mods_mutex);
++    if (!opened_mods_by_id.contains(mod_id)) {
++        return;
++    }
++    // Switching back to what the running game has cancels the change.
++    if (enabled == enabled_mods.contains(mod_id)) {
++        next_start_changes.erase(mod_id);
++    }
++    else {
++        next_start_changes[mod_id] = enabled;
++    }
++}
++
++bool recomp::mods::ModContext::get_next_start_change(const std::string& mod_id, bool& enabled) const {
++    auto find_it = next_start_changes.find(mod_id);
++    if (find_it == next_start_changes.end()) {
++        return false;
++    }
++    enabled = find_it->second;
++    return true;
++}
++
++size_t recomp::mods::ModContext::count_next_start_changes() const {
++    return next_start_changes.size();
++}
++
++void recomp::mods::ModContext::apply_next_start_changes() {
++    std::unordered_set<std::string> next_enabled;
++    std::vector<std::string> order;
++    {
++        std::unique_lock lock(opened_mods_mutex);
++        // The running game keeps the mods it loaded. The choices go into the enabled set too, so a later save
++        // of the mod configuration doesn't undo them.
++        for (const auto& [mod_id, enabled] : next_start_changes) {
++            if (enabled) {
++                enabled_mods.emplace(mod_id);
++            }
++            else {
++                enabled_mods.erase(mod_id);
++            }
++#if defined(__PROSPERO__)
++            fprintf(stderr, "[mods] %s turned %s for the next start\n", mod_id.c_str(), enabled ? "on" : "off");
++#endif
++        }
++        next_start_changes.clear();
++        next_enabled = enabled_mods;
++        for (size_t mod_index : opened_mods_order) {
++            order.emplace_back(opened_mods[mod_index].manifest.mod_id);
++        }
++    }
++    // Written now rather than by the configuration thread: the game is closed straight after.
++    save_mods_config(mods_config_path, latest_game_mode, next_enabled, order);
++#if defined(__PROSPERO__)
++    fflush(stderr);
++#endif
++}
++
++void recomp::mods::ModContext::discard_next_start_changes() {
++    std::unique_lock lock(opened_mods_mutex);
++    next_start_changes.clear();
++}
++
++// The enabled mods with the pending changes applied. Caller holds opened_mods_mutex.
++static std::unordered_set<std::string> next_start_enabled_set(
++    const std::unordered_set<std::string>& enabled_mods, const std::unordered_map<std::string, bool>& changes)
++{
++    std::unordered_set<std::string> enabled = enabled_mods;
++    for (const auto& [mod_id, mod_enabled] : changes) {
++        if (mod_enabled) {
++            enabled.emplace(mod_id);
++        }
++        else {
++            enabled.erase(mod_id);
++        }
++    }
++    return enabled;
++}
++
++bool recomp::mods::ModContext::is_mod_enabled_next_start(const std::string& mod_id) {
++    std::unique_lock lock(opened_mods_mutex);
++    return next_start_enabled_set(enabled_mods, next_start_changes).contains(mod_id);
++}
++
++bool recomp::mods::ModContext::is_mod_required_next_start(const std::string& mod_id) {
++    std::unique_lock lock(opened_mods_mutex);
++    const std::unordered_set<std::string> enabled = next_start_enabled_set(enabled_mods, next_start_changes);
++    // Follow the non-optional dependencies of every enabled mod, and theirs in turn.
++    std::unordered_set<std::string> required;
++    std::vector<std::string> pending(enabled.begin(), enabled.end());
++    while (!pending.empty()) {
++        const std::string cur_id = std::move(pending.back());
++        pending.pop_back();
++        auto find_it = opened_mods_by_id.find(cur_id);
++        if (find_it == opened_mods_by_id.end()) {
++            continue;
++        }
++        for (const Dependency& dependency : opened_mods[find_it->second].manifest.dependencies) {
++            if (!dependency.optional && required.emplace(dependency.mod_id).second) {
++                pending.emplace_back(dependency.mod_id);
++            }
++        }
++    }
++    return required.contains(mod_id);
++}
++
+ bool recomp::mods::ModContext::is_mod_enabled(const std::string& mod_id) const {
+     return enabled_mods.contains(mod_id);
+ }
+@@ -1761,12 +1945,16 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+         }
+     }
+ 
++#if defined(__PROSPERO__)
++    fprintf(stderr, "[mods] code loaded for %zu mods (%zu errors)\n", loaded_code_mods.size(), ret.size());
++    fflush(stderr);
++#endif
+     // Exit early if errors were found.
+     if (!ret.empty()) {
+         unload_mods();
+         return ret;
+     }
+-    
++
+     // Resolve code dependencies for all mods.
+     for (size_t mod_index : loaded_code_mods) {
+         auto& mod = opened_mods[mod_index];
+@@ -1782,6 +1970,10 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+         }
+     }
+ 
++#if defined(__PROSPERO__)
++    fprintf(stderr, "[mods] dependencies resolved (%zu errors)\n", ret.size());
++    fflush(stderr);
++#endif
+     // Exit early if errors were found.
+     if (!ret.empty()) {
+         unload_mods();
+@@ -1821,8 +2013,16 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
+         }
+     }
+ 
++#if defined(__PROSPERO__)
++    fprintf(stderr, "[mods] hooks regenerated (%zu unprocessed); finishing event and hook setup\n", unprocessed_hooks.size());
++    fflush(stderr);
++#endif
+     finish_event_setup(*this);
+     finish_hook_setup(*this);
++#if defined(__PROSPERO__)
++    fprintf(stderr, "[mods] all mods loaded\n");
++    fflush(stderr);
++#endif
+ 
+     active_game = mod_game_index;
+     return ret;
+@@ -2630,7 +2830,21 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
+ 
+         // Copy the original bytes so they can be restored later after the mod is unloaded.
+         PatchData& cur_replacement_data = patched_funcs[to_replace];
++#if defined(__PROSPERO__)
++        // Not on the PS5: the title's code is execute-only, and reading it ends the process. The bytes are
++        // only needed to undo a patch, and on the PS5 mods change only when the game starts again
++        // (unpatch_func does nothing there).
++        {
++            static bool reported = false;
++            if (!reported) {
++                reported = true;
++                fprintf(stderr, "[mods] replacing game functions (first at %p), original bytes not read\n", reinterpret_cast<void*>(to_replace));
++                fflush(stderr);
++            }
++        }
++#else
+         memcpy(cur_replacement_data.replaced_bytes.data(), reinterpret_cast<void*>(to_replace), cur_replacement_data.replaced_bytes.size());
++#endif
+         cur_replacement_data.mod_id = mod.manifest.mod_id;
+ 
+         // Patch the function to redirect it to the replacement.
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 850689d..8f72eed 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -30,6 +30,9 @@
+ #    include <Windows.h>
+ #else
+ #    include <sys/mman.h>
++#    if defined(__PROSPERO__)
++#        include <ps5platform/kernel.h>
++#    endif
+ #endif
+ 
+ #if defined(_WIN32)
+@@ -552,6 +555,12 @@ std::atomic_bool exited = false;
+ moodycamel::LightweightSemaphore graphics_shutdown_ready;
+ 
+ void ultramodern::quit() {
++#if defined(__PROSPERO__)
++    // PS5: a normal shutdown ends the runtime's and RT64's threads one by one, and a thread whose
++    // thread_local objects free memory as it ends crashes the title, which the console then reports as an
++    // error. The title is closed through the system instead, once pending writes are done.
++    ultramodern::error_handling::close_title(true);
++#endif
+     exited.store(true);
+     GameStatus desired = GameStatus::None;
+     game_status.compare_exchange_strong(desired, GameStatus::Quit);
+@@ -565,6 +574,41 @@ void recomp::mods::enable_mod(const std::string& mod_id, bool enabled) {
+     return mod_context->enable_mod(mod_id, enabled, true);
+ }
+ 
++void recomp::mods::set_next_start_change(const std::string& mod_id, bool enabled) {
++    std::lock_guard lock { mod_context_mutex };
++    mod_context->set_next_start_change(mod_id, enabled);
++}
++
++bool recomp::mods::get_next_start_change(const std::string& mod_id, bool& enabled) {
++    std::lock_guard lock { mod_context_mutex };
++    return mod_context->get_next_start_change(mod_id, enabled);
++}
++
++size_t recomp::mods::count_next_start_changes() {
++    std::lock_guard lock { mod_context_mutex };
++    return mod_context->count_next_start_changes();
++}
++
++void recomp::mods::apply_next_start_changes() {
++    std::lock_guard lock { mod_context_mutex };
++    mod_context->apply_next_start_changes();
++}
++
++bool recomp::mods::is_mod_enabled_next_start(const std::string& mod_id) {
++    std::lock_guard lock { mod_context_mutex };
++    return mod_context->is_mod_enabled_next_start(mod_id);
++}
++
++bool recomp::mods::is_mod_required_next_start(const std::string& mod_id) {
++    std::lock_guard lock { mod_context_mutex };
++    return mod_context->is_mod_required_next_start(mod_id);
++}
++
++void recomp::mods::discard_next_start_changes() {
++    std::lock_guard lock { mod_context_mutex };
++    mod_context->discard_next_start_changes();
++}
++
+ bool recomp::mods::is_mod_enabled(const std::string& mod_id) {
+     std::lock_guard lock { mod_context_mutex };
+     return mod_context->is_mod_enabled(mod_id);
+@@ -946,6 +990,58 @@ void recomp::start(const recomp::Configuration& cfg) {
+             VirtualFree(rdram, 0, MEM_RELEASE);
+         }
+     }
++#elif defined(__PROSPERO__)
++    // A title's anonymous memory budget (448 MiB) cannot hold rdram, and an anonymous PROT_NONE
++    // reservation of 1 GiB or more fails. Reserve the address space with the kernel instead and back
++    // the first mem_size bytes with direct memory at its start; the rest stays without access.
++    // The reservation goes at a fixed address: where the kernel puts mappings it is given no address
++    // for is the 4 GiB window RADV needs for its GPU ring (radv_ps5_platform.c), and a 4 GiB
++    // reservation there left RADV without one (no Vulkan device). The candidates avoid that window
++    // (0x200000000-0x2FFFFFFFF) and RADV's device-memory region (256 GiB at 0x4000000000); the first
++    // the kernel accepts is used (0x300000000 on the tested console).
++    static constexpr uintptr_t rdram_candidates[] = {
++        0x0300000000, 0x0400000000, 0x0800000000, 0x1000000000, 0x2000000000,
++        0x8000000000, 0x10000000000, 0x40000000000,
++    };
++    int64_t rdram_direct = 0;
++    void* rdram_base = nullptr;
++    alloc_failed = true;
++    for (uintptr_t candidate : rdram_candidates) {
++        void* at = reinterpret_cast<void*>(candidate);
++        int32_t res = sceKernelReserveVirtualRange(&at, allocation_size, 0, PS5_KERNEL_DIRECT_ALIGNMENT);
++        if (res != 0) {
++            continue;
++        }
++        if (at != reinterpret_cast<void*>(candidate)) {
++            sceKernelMunmap(at, allocation_size);
++            continue;
++        }
++        rdram_base = at;
++        alloc_failed = false;
++        break;
++    }
++    if (!alloc_failed) {
++        int32_t res = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), mem_size,
++            PS5_KERNEL_DIRECT_ALIGNMENT, PS5_KERNEL_DIRECT_TYPE_CPU, &rdram_direct);
++        alloc_failed = res != 0;
++        if (!alloc_failed) {
++            void* mapped = rdram_base;
++            res = sceKernelMapDirectMemory(&mapped, mem_size, PS5_KERNEL_PROT_CPU_READ | PS5_KERNEL_PROT_CPU_WRITE,
++                PS5_KERNEL_MAP_FIXED, rdram_direct, PS5_KERNEL_DIRECT_ALIGNMENT);
++            alloc_failed = res != 0 || mapped != rdram_base;
++            if (alloc_failed) {
++                sceKernelReleaseDirectMemory(rdram_direct, mem_size);
++            }
++        }
++        if (alloc_failed) {
++            sceKernelMunmap(rdram_base, allocation_size);
++        }
++    }
++    rdram = reinterpret_cast<uint8_t*>(rdram_base);
++    if (!alloc_failed) {
++        // Direct memory is not cleared on allocation; the runtime expects zeroed rdram.
++        memset(rdram, 0, mem_size);
++    }
+ #else
+     rdram = (uint8_t*)mmap(NULL, allocation_size, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+     alloc_failed = rdram == reinterpret_cast<uint8_t*>(MAP_FAILED);
+@@ -1001,6 +1097,9 @@ void recomp::start(const recomp::Configuration& cfg) {
+ #ifdef _WIN32
+     // VirtualFree returns zero on failure.
+     free_failed = (VirtualFree(rdram, 0, MEM_RELEASE) == 0);
++#elif defined(__PROSPERO__)
++    free_failed = (sceKernelMunmap(rdram, allocation_size) != 0) ||
++        (sceKernelReleaseDirectMemory(rdram_direct, mem_size) != 0);
+ #else
+     // munmap returns -1 on failure.
+     free_failed = (munmap(rdram, allocation_size) == -1);
+diff --git a/ultramodern/include/ultramodern/error_handling.hpp b/ultramodern/include/ultramodern/error_handling.hpp
+index 303e6b7..9f187a0 100644
+--- a/ultramodern/include/ultramodern/error_handling.hpp
++++ b/ultramodern/include/ultramodern/error_handling.hpp
+@@ -23,6 +23,13 @@ namespace ultramodern {
+         void message_box(const char* msg);
+ 
+         [[noreturn]] void quick_exit(const char* filename, int line, const char *func, int exit_status = EXIT_FAILURE);
++
++#if defined(__PROSPERO__)
++        // Ends a PS5 title the way the console allows: the libc exits (exit, _Exit, quick_exit) are system calls
++        // a title may not make, and a shutdown that ends the threads one by one crashes in their thread_local
++        // destructors. With wait_for_writes, the save file and settings writers get time to finish first.
++        [[noreturn]] void close_title(bool wait_for_writes);
++#endif
+     }
+ }
+ 
+diff --git a/ultramodern/include/ultramodern/renderer_context.hpp b/ultramodern/include/ultramodern/renderer_context.hpp
+index d60c4ec..9c07003 100644
+--- a/ultramodern/include/ultramodern/renderer_context.hpp
++++ b/ultramodern/include/ultramodern/renderer_context.hpp
+@@ -54,7 +54,7 @@ namespace ultramodern {
+             auto operator<=>(const WindowHandle&) const = default;
+         };
+ // TODO add a native window handle option here (Display/Window for x11 and ANativeWindow for Android) as a compile-time option.
+-#elif defined(__linux__) || defined(__ANDROID__)
++#elif defined(__linux__) || defined(__ANDROID__) || defined(__PROSPERO__)
+         using WindowHandle = SDL_Window*;
+ #elif defined(__APPLE__)
+         struct WindowHandle {
+diff --git a/ultramodern/src/error_handling.cpp b/ultramodern/src/error_handling.cpp
+index 8ca779e..9f22ed5 100644
+--- a/ultramodern/src/error_handling.cpp
++++ b/ultramodern/src/error_handling.cpp
+@@ -1,7 +1,15 @@
+ #include <cstdio>
++#include <cstdlib>
+ 
+ #include "ultramodern/error_handling.hpp"
+ 
++#if defined(__PROSPERO__)
++#include <chrono>
++#include <thread>
++
++extern "C" int sceSystemServiceLoadExec(const char* path, char* const argv[]);
++#endif
++
+ static ultramodern::error_handling::callbacks_t error_handling_callbacks{};
+ 
+ void ultramodern::error_handling::set_callbacks(const ultramodern::error_handling::callbacks_t& callbacks) {
+@@ -12,17 +20,53 @@ void ultramodern::error_handling::message_box(const char* msg) {
+     // We print the message to stderr since the user may not have provided a message_box callback
+ 
+     fprintf(stderr, "%s\n", msg);
++#if defined(__PROSPERO__)
++    // The PS5 log is buffered: write the message out before the frontend shows it, in case showing it
++    // ends the process.
++    fprintf(stderr, "[error] (message box shown next)\n");
++    fflush(stderr);
++#endif
+ 
+     if (error_handling_callbacks.message_box != nullptr) {
+         error_handling_callbacks.message_box(msg);
+     }
+ }
+ 
++#if defined(__PROSPERO__)
++void ultramodern::error_handling::close_title(bool wait_for_writes) {
++    if (wait_for_writes) {
++        // The save file and settings writers batch writes for up to about a second, and keep running meanwhile.
++        fprintf(stderr, "[dk64] closing: letting pending writes finish\n");
++        fflush(stderr);
++        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
++    }
++
++    // The system service closes the title and returns to the home screen, as a title's own exit is meant to.
++    fprintf(stderr, "[dk64] closing: asking the system to close the title\n");
++    fflush(stderr);
++    fflush(stdout);
++    const int result = sceSystemServiceLoadExec("exit", nullptr);
++    fprintf(stderr, "[dk64] closing: sceSystemServiceLoadExec(\"exit\") returned 0x%08X\n", (unsigned)result);
++    fflush(stderr);
++
++    // The shell closes the title shortly after the call. Wait for it here rather than return into a shutdown,
++    // as ProsperoStore's quit does (BlackBearReloaded's ps5-homebrew-ui: "Returning from main or calling
++    // exit() crashes a native title; stay alive until the shell closes the title").
++    for (;;) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    }
++}
++#endif
++
+ void ultramodern::error_handling::quick_exit(const char* filename, int line, const char *func, int exit_status) {
+     fprintf(stderr, "Exiting with exit status '%i'. Function %s, at file %s:%i\n", exit_status, func, filename, line);
+ 
+ #ifdef __APPLE__
+     std::_Exit(exit_status);
++#elif defined(__PROSPERO__)
++    // quick_exit and _Exit are system calls a PS5 title may not make (SIGSYS).
++    (void)exit_status;
++    close_title(false);
+ #else
+     std::quick_exit(exit_status);
+ #endif
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index 6e3ed18..2ab2f7e 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -137,6 +137,14 @@ void ultramodern::set_native_thread_priority(ThreadPriority pri) {
+     //         break;
+     // }
+ }
++#elif defined(__PROSPERO__)
++#include <pthread_np.h>
++
++void ultramodern::set_native_thread_name(const std::string& name) {
++    pthread_set_name_np(pthread_self(), name.c_str());
++}
++
++void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
+ #elif defined(__APPLE__)
+ void ultramodern::set_native_thread_name(const std::string& name) {
+     if (name.length() > 15) {

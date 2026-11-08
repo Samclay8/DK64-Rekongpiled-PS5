@@ -1,0 +1,759 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 79dfc38..683fc06 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -69,9 +69,21 @@ set(ZSTD_LEGACY_SUPPORT OFF)
+ set(ZSTD_BUILD_STATIC ON)
+ set(ZSTD_BUILD_SHARED OFF)
+ 
+-add_subdirectory(src/tools/file_to_c)
++if (PS5)
++    # Cross build: file_to_c runs on the host, built beforehand (DK64_HOST_TOOLS).
++    add_executable(file_to_c IMPORTED GLOBAL)
++    set_target_properties(file_to_c PROPERTIES IMPORTED_LOCATION "${DK64_HOST_TOOLS}/file_to_c")
++else()
++    add_subdirectory(src/tools/file_to_c)
++endif()
+ add_subdirectory(src/contrib/re-spirv)
+-add_subdirectory(src/contrib/nativefiledialog-extended)
++if (PS5)
++    # A title has no file dialogs: a stub library that always cancels.
++    add_library(nfd STATIC "${DK64_PS5_DIR}/nfd_stub.c")
++    target_include_directories(nfd PUBLIC "${PROJECT_SOURCE_DIR}/src/contrib/nativefiledialog-extended/src/include")
++else()
++    add_subdirectory(src/contrib/nativefiledialog-extended)
++endif()
+ add_subdirectory(src/contrib/zstd/build/cmake)
+ 
+ if (CMAKE_SYSTEM_NAME MATCHES "Linux" AND RT64_SDL_WINDOW_VULKAN)
+@@ -341,6 +353,7 @@ set (SOURCES
+     "${PROJECT_SOURCE_DIR}/src/gui/rt64_debugger_inspector.cpp"
+     "${PROJECT_SOURCE_DIR}/src/gui/rt64_file_dialog.cpp"
+     "${PROJECT_SOURCE_DIR}/src/gui/rt64_inspector.cpp"
++    "${PROJECT_SOURCE_DIR}/src/gui/rt64_performance_overlay.cpp"
+ 
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_application.cpp"
+     "${PROJECT_SOURCE_DIR}/src/hle/rt64_application_window.cpp"
+@@ -446,8 +459,13 @@ target_link_libraries(rt64 libzstd_static)
+ target_link_libraries(rt64 plume)
+ 
+ # Add tools.
+-add_subdirectory(src/tools/texture_hasher)
+-add_subdirectory(src/tools/texture_packer)
++if (PS5)
++    # Desktop tools: on the PS5 each would only be linked into a title nobody runs.
++    set_target_properties(re-spirv-cli PROPERTIES EXCLUDE_FROM_ALL TRUE)
++else()
++    add_subdirectory(src/tools/texture_hasher)
++    add_subdirectory(src/tools/texture_packer)
++endif()
+ 
+ # Add any Apple-specific source files and libraries
+ if (APPLE)
+diff --git a/src/common/rt64_thread.cpp b/src/common/rt64_thread.cpp
+index c4b080b..5b2f290 100644
+--- a/src/common/rt64_thread.cpp
++++ b/src/common/rt64_thread.cpp
+@@ -12,6 +12,9 @@
+ #   include "utf8conv/utf8conv.h"
+ #elif defined(__linux__)
+ #   include <pthread.h>
++#elif defined(__PROSPERO__)
++#   include <pthread.h>
++#   include <pthread_np.h>
+ #endif
+ 
+ namespace RT64 {
+@@ -47,6 +50,8 @@ namespace RT64 {
+         pthread_setname_np(pthread_self(), str.c_str());
+ #   elif defined(__APPLE__)
+         pthread_setname_np(str.c_str());
++#   elif defined(__PROSPERO__)
++        pthread_set_name_np(pthread_self(), str.c_str());
+ #   else
+         static_assert(false, "Unimplemented");
+ #   endif
+@@ -55,7 +60,7 @@ namespace RT64 {
+     void Thread::setCurrentThreadPriority(Priority priority) {
+ #   if defined(_WIN32)
+         SetThreadPriority(GetCurrentThread(), toWindowsPriority(priority));
+-#   elif defined(__linux__) || defined(__APPLE__)
++#   elif defined(__linux__) || defined(__APPLE__) || defined(__PROSPERO__)
+         // On Linux, thread priorities can't be changed under the default scheduler policy (SCHED_OTHER) and the other policies
+         // that are available without root privileges are lower priority. Instead you can set the thread's "nice" value, which ranges
+         // from -20 to 19 (lower being higher priority). However, by strict POSIX spec "nice" is meant to be per-process instead of
+diff --git a/src/gui/rt64_performance_overlay.cpp b/src/gui/rt64_performance_overlay.cpp
+new file mode 100644
+index 0000000..8b8872e
+--- /dev/null
++++ b/src/gui/rt64_performance_overlay.cpp
+@@ -0,0 +1,433 @@
++//
++// RT64
++//
++// Performance overlay (DK64 PS5 port). See rt64_performance_overlay.h.
++//
++
++#include "rt64_performance_overlay.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <mutex>
++#include <unordered_map>
++
++#include "imgui/imgui.h"
++
++// Volk must be included before the ImGui Vulkan backend.
++#include "plume_vulkan.h"
++
++#include "imgui/backends/imgui_impl_vulkan.h"
++
++#if defined(__PROSPERO__)
++#   include <ps5platform/heap.h>
++#   include <ps5platform/kernel.h>
++#endif
++
++namespace {
++    std::atomic<int> overlayMode{ 0 };
++    std::mutex fontPathMutex;
++    std::string fontPath;
++
++    void checkOverlayVulkanResult(VkResult res) {
++        if (res != 0) {
++            fprintf(stderr, "[overlay] ImGui Vulkan backend error 0x%X\n", res);
++        }
++    }
++
++    struct MemoryInfo {
++        bool valid = false;
++        size_t heapMapped = 0;
++        size_t heapPeak = 0;
++        size_t directTotal = 0;
++        size_t directFree = 0;
++        size_t flexibleConfigured = 0;
++        size_t flexibleFree = 0;
++    };
++
++    MemoryInfo queryMemory() {
++        MemoryInfo info;
++#if defined(__PROSPERO__)
++        // The title's heap in direct memory (every malloc goes there), and what the kernel reports free:
++        // direct memory (also where RADV's textures and buffers live) and the flexible-memory budget.
++        struct ps5_heap_stats heap {};
++        ps5_heap_stats(&heap);
++        info.heapMapped = heap.mapped_bytes;
++        info.heapPeak = heap.peak_bytes;
++        const int64_t total = sceKernelGetDirectMemorySize();
++        int64_t start = 0;
++        size_t available = 0;
++        if ((total > 0) && (sceKernelAvailableDirectMemorySize(0, total, PS5_KERNEL_DIRECT_ALIGNMENT, &start, &available) == 0)) {
++            info.directTotal = size_t(total);
++            info.directFree = available;
++        }
++        sceKernelConfiguredFlexibleMemorySize(&info.flexibleConfigured);
++        sceKernelAvailableFlexibleMemorySize(&info.flexibleFree);
++        info.valid = true;
++#endif
++        return info;
++    }
++
++    MemoryInfo lastMemory;
++
++    float toMiB(size_t bytes) {
++        return float(double(bytes) / (1024.0 * 1024.0));
++    }
++
++    // Text with a soft shadow, right-aligned to rightX, as PCSX2 draws its overlay lines.
++    void drawRightAlignedText(ImDrawList *drawList, float rightX, float &y, float scale, ImU32 color, const char *text) {
++        ImFont *font = ImGui::GetFont();
++        const float size = ImGui::GetFontSize();
++        const ImVec2 textSize = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
++        const ImVec2 pos(rightX - textSize.x, y);
++        const float shadow = std::ceil(scale * 1.5f);
++        drawList->AddText(font, size, ImVec2(pos.x + shadow, pos.y + shadow), IM_COL32(0, 0, 0, 160), text);
++        drawList->AddText(font, size, pos, color, text);
++        y += textSize.y + 2.0f * scale;
++    }
++
++    ImU32 fpsColor(float fps, uint32_t targetRate) {
++        const float target = (targetRate > 0) ? float(targetRate) : 60.0f;
++        if (fps >= target * 0.95f) {
++            return IM_COL32(120, 255, 120, 255);
++        }
++        else if (fps >= target * 0.5f) {
++            return IM_COL32(255, 220, 90, 255);
++        }
++        else {
++            return IM_COL32(255, 100, 100, 255);
++        }
++    }
++}
++
++namespace RT64 {
++    struct PerformanceOverlayVulkan {
++        VkDevice device = VK_NULL_HANDLE;
++        VkRenderPass renderPass = VK_NULL_HANDLE;
++        VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
++
++        ~PerformanceOverlayVulkan() {
++            if (renderPass != VK_NULL_HANDLE) {
++                vkDestroyRenderPass(device, renderPass, nullptr);
++            }
++
++            if (descriptorPool != VK_NULL_HANDLE) {
++                vkDestroyDescriptorPool(device, descriptorPool, nullptr);
++            }
++        }
++    };
++
++    void PerformanceOverlay::setMode(Mode mode) {
++        overlayMode.store(int(mode));
++    }
++
++    PerformanceOverlay::Mode PerformanceOverlay::getMode() {
++        return Mode(overlayMode.load());
++    }
++
++    void PerformanceOverlay::setFontPath(const std::string &path) {
++        const std::lock_guard<std::mutex> lock(fontPathMutex);
++        fontPath = path;
++    }
++
++    PerformanceOverlay::PerformanceOverlay(RenderDevice *device, const RenderSwapChain *swapChain) {
++        this->device = device;
++        this->swapChain = swapChain;
++        lastPresent = Clock::now();
++        windowStart = lastPresent;
++        lastLog = lastPresent;
++    }
++
++    PerformanceOverlay::~PerformanceOverlay() {
++        if (context != nullptr) {
++            ImGuiContext *previous = ImGui::GetCurrentContext();
++            ImGui::SetCurrentContext(context);
++            ImGui_ImplVulkan_Shutdown();
++            vulkan.reset();
++            ImGui::DestroyContext(context);
++            ImGui::SetCurrentContext((previous == context) ? nullptr : previous);
++        }
++    }
++
++    // ImGui and its Vulkan backend, made the first time the overlay is shown. Its own context, so it never
++    // touches the inspector's.
++    void PerformanceOverlay::initImGui(float scale) {
++        ImGuiContext *previous = ImGui::GetCurrentContext();
++        context = ImGui::CreateContext();
++        ImGui::SetCurrentContext(context);
++
++        ImGuiIO &io = ImGui::GetIO();
++        io.IniFilename = nullptr;
++        io.LogFilename = nullptr;
++        ImGui::StyleColorsDark();
++
++        std::string path;
++        {
++            const std::lock_guard<std::mutex> lock(fontPathMutex);
++            path = fontPath;
++        }
++
++        ImFont *font = nullptr;
++        if (!path.empty()) {
++            ImFontConfig fontConfig;
++            fontConfig.OversampleH = 2;
++            font = io.Fonts->AddFontFromFileTTF(path.c_str(), std::round(20.0f * scale), &fontConfig);
++        }
++
++        if (font == nullptr) {
++            ImFontConfig fontConfig;
++            fontConfig.SizePixels = std::round(13.0f * scale);
++            io.Fonts->AddFontDefault(&fontConfig);
++            fprintf(stderr, "[overlay] font '%s' not loaded, using ImGui's own\n", path.c_str());
++        }
++
++        VulkanDevice *interfaceDevice = static_cast<VulkanDevice *>(device);
++        const VulkanSwapChain *interfaceSwapChain = static_cast<const VulkanSwapChain *>(swapChain);
++        ImGui_ImplVulkan_LoadFunctions([](const char *functionName, void *vulkanInstance) {
++            return vkGetInstanceProcAddr(*(reinterpret_cast<VkInstance *>(vulkanInstance)), functionName);
++        }, &interfaceDevice->renderInterface->instance);
++
++        std::unordered_map<VkDescriptorType, uint32_t> typeCounts;
++        typeCounts[VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER] = 1;
++
++        vulkan = std::make_unique<PerformanceOverlayVulkan>();
++        vulkan->device = interfaceDevice->vk;
++        vulkan->renderPass = VulkanGraphicsPipeline::createRenderPass(interfaceDevice, &interfaceSwapChain->pickedSurfaceFormat.format, 1, VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT);
++        vulkan->descriptorPool = VulkanDescriptorSet::createDescriptorPool(interfaceDevice, typeCounts, false);
++
++        ImGui_ImplVulkan_InitInfo initInfo = {};
++        initInfo.Instance = interfaceDevice->renderInterface->instance;
++        initInfo.PhysicalDevice = interfaceDevice->physicalDevice;
++        initInfo.Device = vulkan->device;
++        initInfo.QueueFamily = interfaceSwapChain->commandQueue->familyIndex;
++        initInfo.Queue = interfaceSwapChain->commandQueue->queue->vk;
++        initInfo.DescriptorPool = vulkan->descriptorPool;
++        initInfo.RenderPass = vulkan->renderPass;
++        initInfo.Subpass = 0;
++        initInfo.MinImageCount = 2;
++        initInfo.ImageCount = 2;
++        initInfo.CheckVkResultFn = &checkOverlayVulkanResult;
++        ImGui_ImplVulkan_Init(&initInfo);
++
++        ImGui::SetCurrentContext(previous);
++        fprintf(stderr, "[overlay] ready (font %.0f px)\n", std::round(20.0f * scale));
++    }
++
++    void PerformanceOverlay::recordPresent(bool newGameFrame, uint32_t rate) {
++        const Clock::time_point now = Clock::now();
++        const float frameMs = std::chrono::duration<float, std::milli>(now - lastPresent).count();
++        lastPresent = now;
++        targetRate = rate;
++
++        windowPresents++;
++        if (newGameFrame) {
++            windowGameFrames++;
++        }
++
++        if (windowPresents == 1) {
++            windowMinMs = frameMs;
++            windowMaxMs = frameMs;
++        }
++        else {
++            windowMinMs = std::min(windowMinMs, frameMs);
++            windowMaxMs = std::max(windowMaxMs, frameMs);
++        }
++
++        frameTimeHistory[historyPos] = frameMs;
++        fpsHistory[historyPos] = (frameMs > 0.0f) ? (1000.0f / frameMs) : 0.0f;
++        historyPos = (historyPos + 1) % HistorySize;
++        historyCount = std::min(historyCount + 1, HistorySize);
++
++        const float windowSeconds = std::chrono::duration<float>(now - windowStart).count();
++        if (windowSeconds >= 1.0f) {
++            displayFps = float(windowPresents) / windowSeconds;
++            gameFps = float(windowGameFrames) / windowSeconds;
++            avgFrameMs = (windowSeconds * 1000.0f) / float(windowPresents);
++            minFrameMs = windowMinMs;
++            maxFrameMs = windowMaxMs;
++            windowStart = now;
++            windowPresents = 0;
++            windowGameFrames = 0;
++            lastMemory = queryMemory();
++        }
++
++        // The same numbers in the log every 10 seconds, whether the overlay is shown or not.
++        if (std::chrono::duration<float>(now - lastLog).count() >= 10.0f) {
++            lastLog = now;
++            if (lastMemory.valid) {
++                fprintf(stderr, "[perf] display %.1f fps, game %.1f fps, frame %.2f ms (min %.2f, max %.2f), target %u Hz, heap %.0f MiB (peak %.0f), direct free %.0f of %.0f MiB, flexible free %.0f of %.0f MiB\n",
++                    displayFps, gameFps, avgFrameMs, minFrameMs, maxFrameMs, targetRate,
++                    toMiB(lastMemory.heapMapped), toMiB(lastMemory.heapPeak), toMiB(lastMemory.directFree), toMiB(lastMemory.directTotal),
++                    toMiB(lastMemory.flexibleFree), toMiB(lastMemory.flexibleConfigured));
++            }
++            else {
++                fprintf(stderr, "[perf] display %.1f fps, game %.1f fps, frame %.2f ms (min %.2f, max %.2f), target %u Hz\n",
++                    displayFps, gameFps, avgFrameMs, minFrameMs, maxFrameMs, targetRate);
++            }
++        }
++    }
++
++    void PerformanceOverlay::drawInfoBox(Mode mode, float scale, float margin, float &y, float width) {
++        ImDrawList *drawList = ImGui::GetBackgroundDrawList();
++        const float rightX = width - margin;
++        char line[192];
++
++        snprintf(line, sizeof(line), "%.0f FPS  (game %.0f)", displayFps, gameFps);
++        drawRightAlignedText(drawList, rightX, y, scale, fpsColor(displayFps, targetRate), line);
++
++        if (mode != Mode::Detailed) {
++            return;
++        }
++
++        const ImU32 white = IM_COL32(255, 255, 255, 255);
++        snprintf(line, sizeof(line), "Frame %.2f ms  (min %.2f, max %.2f)", avgFrameMs, minFrameMs, maxFrameMs);
++        drawRightAlignedText(drawList, rightX, y, scale, white, line);
++
++        snprintf(line, sizeof(line), "Target %u Hz  |  %ux%u", targetRate, swapChain->getWidth(), swapChain->getHeight());
++        drawRightAlignedText(drawList, rightX, y, scale, white, line);
++
++        if (lastMemory.valid) {
++            snprintf(line, sizeof(line), "Heap %.0f MiB  (peak %.0f)", toMiB(lastMemory.heapMapped), toMiB(lastMemory.heapPeak));
++            drawRightAlignedText(drawList, rightX, y, scale, white, line);
++
++            snprintf(line, sizeof(line), "Direct memory free %.0f of %.0f MiB", toMiB(lastMemory.directFree), toMiB(lastMemory.directTotal));
++            drawRightAlignedText(drawList, rightX, y, scale, white, line);
++        }
++    }
++
++    // The frame-time graph, after PCSX2's: frame time in blue against the left axis, frame rate in green
++    // against the right one, on a translucent panel.
++    void PerformanceOverlay::drawGraph(float scale, float margin, float &y, float width) {
++        if (historyCount < 2) {
++            return;
++        }
++
++        float msMax = 0.0f;
++        float fpsMax = 0.0f;
++        for (size_t i = 0; i < historyCount; i++) {
++            msMax = std::max(msMax, frameTimeHistory[i]);
++            fpsMax = std::max(fpsMax, fpsHistory[i]);
++        }
++
++        const float Smoothing = 0.1f;
++        graphMsMax += (std::max(msMax * 1.1f, 20.0f) - graphMsMax) * Smoothing;
++        graphFpsMax += (std::max(fpsMax * 1.1f, 70.0f) - graphFpsMax) * Smoothing;
++
++        const float fontSize = ImGui::GetFontSize();
++        const float pad = 6.0f * scale;
++        const float labelWidth = ImGui::CalcTextSize("000.0").x + 4.0f * scale;
++        const ImVec2 graphSize(260.0f * scale, 80.0f * scale);
++        const float legendHeight = fontSize + pad;
++        const ImVec2 totalSize(labelWidth * 2.0f + graphSize.x + 2.0f * pad, graphSize.y + legendHeight + 2.0f * pad + fontSize * 0.5f);
++
++        ImGui::SetNextWindowPos(ImVec2(width - margin - totalSize.x, y + 4.0f * scale));
++        ImGui::SetNextWindowSize(totalSize);
++        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.45f));
++        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f * scale);
++        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
++        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
++        if (ImGui::Begin("##frame_times", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
++            ImDrawList *drawList = ImGui::GetWindowDrawList();
++            const ImVec2 windowPos = ImGui::GetWindowPos();
++            const ImVec2 plotTL(windowPos.x + pad + labelWidth, windowPos.y + pad + fontSize * 0.5f);
++            const ImVec2 plotBR(plotTL.x + graphSize.x, plotTL.y + graphSize.y);
++            const ImU32 msColor = IM_COL32(100, 200, 255, 230);
++            const ImU32 fpsLineColor = IM_COL32(100, 255, 100, 230);
++
++            drawList->AddRectFilled(plotTL, plotBR, IM_COL32(0, 0, 0, 60));
++
++            const int ticks = 4;
++            char label[32];
++            for (int i = 0; i <= ticks; i++) {
++                const float fraction = float(i) / float(ticks);
++                const float gridY = plotBR.y - fraction * graphSize.y;
++                const float labelY = gridY - fontSize * 0.5f;
++                drawList->AddLine(ImVec2(plotTL.x, gridY), ImVec2(plotBR.x, gridY), IM_COL32(255, 255, 255, 40), 1.0f);
++
++                snprintf(label, sizeof(label), "%.1f", graphMsMin + (graphMsMax - graphMsMin) * fraction);
++                const float labelW = ImGui::CalcTextSize(label).x;
++                drawList->AddText(ImVec2(plotTL.x - labelW - 2.0f * scale, labelY), msColor, label);
++
++                snprintf(label, sizeof(label), "%.0f", graphFpsMin + (graphFpsMax - graphFpsMin) * fraction);
++                drawList->AddText(ImVec2(plotBR.x + 2.0f * scale, labelY), fpsLineColor, label);
++            }
++
++            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
++            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
++            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
++            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
++
++            const int count = int(historyCount);
++            const int offset = (historyCount == HistorySize) ? int(historyPos) : 0;
++            ImGui::SetCursorScreenPos(plotTL);
++            ImGui::PushStyleColor(ImGuiCol_PlotLines, ImGui::ColorConvertU32ToFloat4(msColor));
++            ImGui::PlotLines("##frame_time_plot", frameTimeHistory.data(), count, offset, nullptr, graphMsMin, graphMsMax, graphSize);
++            ImGui::PopStyleColor();
++
++            ImGui::SetCursorScreenPos(plotTL);
++            ImGui::PushStyleColor(ImGuiCol_PlotLines, ImGui::ColorConvertU32ToFloat4(fpsLineColor));
++            ImGui::PlotLines("##fps_plot", fpsHistory.data(), count, offset, nullptr, graphFpsMin, graphFpsMax, graphSize);
++            ImGui::PopStyleColor();
++
++            ImGui::PopStyleVar(2);
++            ImGui::PopStyleColor(2);
++
++            // Legend: a coloured square and the current value for each line.
++            const float square = fontSize * 0.6f;
++            float legendX = plotTL.x;
++            const float legendY = plotBR.y + pad * 0.5f;
++            snprintf(label, sizeof(label), "Frame %.2f ms", avgFrameMs);
++            drawList->AddRectFilled(ImVec2(legendX, legendY + (fontSize - square) * 0.5f), ImVec2(legendX + square, legendY + (fontSize + square) * 0.5f), msColor);
++            legendX += square + 4.0f * scale;
++            drawList->AddText(ImVec2(legendX, legendY), IM_COL32(255, 255, 255, 255), label);
++            legendX += ImGui::CalcTextSize(label).x + 12.0f * scale;
++            snprintf(label, sizeof(label), "FPS %.1f", displayFps);
++            drawList->AddRectFilled(ImVec2(legendX, legendY + (fontSize - square) * 0.5f), ImVec2(legendX + square, legendY + (fontSize + square) * 0.5f), fpsLineColor);
++            legendX += square + 4.0f * scale;
++            drawList->AddText(ImVec2(legendX, legendY), IM_COL32(255, 255, 255, 255), label);
++        }
++
++        ImGui::End();
++        ImGui::PopStyleVar(3);
++        ImGui::PopStyleColor();
++        y += totalSize.y + 4.0f * scale;
++    }
++
++    void PerformanceOverlay::draw(RenderCommandList *commandList, uint32_t width, uint32_t height) {
++        const Mode mode = getMode();
++        if ((mode == Mode::Off) || (width == 0) || (height == 0)) {
++            return;
++        }
++
++        // Sizes are designed at 1080p and scaled to the output: 2x at 4K.
++        const float scale = float(height) / 1080.0f;
++        if (context == nullptr) {
++            initImGui(scale);
++        }
++
++        ImGuiContext *previous = ImGui::GetCurrentContext();
++        ImGui::SetCurrentContext(context);
++
++        ImGuiIO &io = ImGui::GetIO();
++        io.DisplaySize = ImVec2(float(width), float(height));
++        io.DeltaTime = 1.0f / 60.0f;
++        ImGui_ImplVulkan_NewFrame();
++        ImGui::NewFrame();
++
++        const float margin = 24.0f * scale;
++        float y = margin;
++        drawInfoBox(mode, scale, margin, y, float(width));
++        if ((mode == Mode::FpsAndGraph) || (mode == Mode::Detailed)) {
++            drawGraph(scale, margin, y, float(width));
++        }
++
++        ImGui::Render();
++        ImDrawData *drawData = ImGui::GetDrawData();
++        if (drawData != nullptr) {
++            VulkanCommandList *interfaceCommandList = static_cast<VulkanCommandList *>(commandList);
++            ImGui_ImplVulkan_RenderDrawData(drawData, interfaceCommandList->vk);
++        }
++
++        ImGui::SetCurrentContext(previous);
++    }
++};
+diff --git a/src/gui/rt64_performance_overlay.h b/src/gui/rt64_performance_overlay.h
+new file mode 100644
+index 0000000..9b98122
+--- /dev/null
++++ b/src/gui/rt64_performance_overlay.h
+@@ -0,0 +1,87 @@
++//
++// RT64
++//
++// Performance overlay (DK64 PS5 port): an info box and a frame-time graph in the top right corner of the
++// picture, drawn with Dear ImGui by the present thread over everything else. The layout follows PCSX2's
++// performance overlay (pcsx2/ImGui/ImGuiOverlays.cpp, GPL-3.0), as PS5SX2 shows it on the PS5.
++// Vulkan only. The mode is set from the frontend's Graphics settings.
++//
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <memory>
++#include <string>
++
++#include "common/rt64_plume.h"
++
++struct ImGuiContext;
++
++namespace RT64 {
++    struct PerformanceOverlayVulkan;
++
++    struct PerformanceOverlay {
++        enum class Mode : int {
++            Off = 0,
++            Fps = 1,
++            FpsAndGraph = 2,
++            Detailed = 3
++        };
++
++        static void setMode(Mode mode);
++        static Mode getMode();
++        static void setFontPath(const std::string &path);
++
++        PerformanceOverlay(RenderDevice *device, const RenderSwapChain *swapChain);
++        ~PerformanceOverlay();
++
++        // Called by the present thread for every frame it shows. newGameFrame is true for the first frame
++        // shown of each new frame the game drew (the others are RT64's interpolated frames).
++        void recordPresent(bool newGameFrame, uint32_t targetRate);
++
++        // Records the overlay into the command list, inside the swap chain framebuffer's render pass.
++        void draw(RenderCommandList *commandList, uint32_t width, uint32_t height);
++
++    private:
++        static constexpr size_t HistorySize = 240;
++        using Clock = std::chrono::steady_clock;
++
++        RenderDevice *device = nullptr;
++        const RenderSwapChain *swapChain = nullptr;
++        ImGuiContext *context = nullptr;
++        std::unique_ptr<PerformanceOverlayVulkan> vulkan;
++
++        // Every presented frame.
++        Clock::time_point lastPresent;
++        Clock::time_point windowStart;
++        Clock::time_point lastLog;
++        uint32_t windowPresents = 0;
++        uint32_t windowGameFrames = 0;
++        float windowMinMs = 0.0f;
++        float windowMaxMs = 0.0f;
++        std::array<float, HistorySize> frameTimeHistory = {};
++        std::array<float, HistorySize> fpsHistory = {};
++        size_t historyPos = 0;
++        size_t historyCount = 0;
++
++        // Updated once a second.
++        float displayFps = 0.0f;
++        float gameFps = 0.0f;
++        float avgFrameMs = 0.0f;
++        float minFrameMs = 0.0f;
++        float maxFrameMs = 0.0f;
++        uint32_t targetRate = 0;
++
++        // Smoothed graph scales, as PCSX2 does, so the axes don't jump.
++        float graphMsMin = 0.0f;
++        float graphMsMax = 33.4f;
++        float graphFpsMin = 0.0f;
++        float graphFpsMax = 70.0f;
++
++        void initImGui(float scale);
++        void drawInfoBox(Mode mode, float scale, float margin, float &y, float width);
++        void drawGraph(float scale, float margin, float &y, float width);
++    };
++};
+diff --git a/src/hle/rt64_application_window.cpp b/src/hle/rt64_application_window.cpp
+index 08f83e5..c94285b 100755
+--- a/src/hle/rt64_application_window.cpp
++++ b/src/hle/rt64_application_window.cpp
+@@ -7,6 +7,9 @@
+ #include <cassert>
+ #include <stdio.h>
+ #include <SDL.h>
++#if defined(__PROSPERO__)
++#   include <pthread_np.h>
++#endif
+ 
+ #if defined(_WIN32)
+ #   include <Windows.h>
+@@ -105,7 +108,7 @@ namespace RT64 {
+         bounds.height = rect.bottom - rect.top;
+ #   elif defined(__ANDROID__)
+         static_assert(false && "Android unimplemented");
+-#   elif defined(__linux__) || defined(__APPLE__)
++#   elif defined(__linux__) || defined(__APPLE__) || defined(__PROSPERO__)
+         if (SDL_VideoInit(nullptr) != 0) {
+             printf("Failed to init SDL2 video: %s\n", SDL_GetError());
+             assert(false && "Failed to init SDL2 video");
+@@ -166,6 +169,8 @@ namespace RT64 {
+         uint64_t tid;
+         pthread_threadid_np(nullptr, &tid);
+         setup(windowHandle, listener, tid);
++#   elif defined(__PROSPERO__)
++        setup(windowHandle, listener, uint32_t(pthread_getthreadid_np()));
+ #   else
+         setup(windowHandle, listener, pthread_self());
+ #   endif
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index 7de5b69..0df9271 100644
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -9,6 +9,32 @@
+ 
+ #include "rt64_workload_queue.h"
+ 
++#if defined(__PROSPERO__)
++#include <chrono>
++#include <cstdio>
++
++// The console's start-up splash (the title's sce_sys/pic1.dds) covers the title's output until the title hides
++// it: it stays up through start-up and goes once the first frame is presented.
++extern "C" int sceSystemServiceHideSplashScreen(void);
++
++namespace {
++    // Set while the program starts (static initialization), for the time in the log.
++    const std::chrono::steady_clock::time_point programStart = std::chrono::steady_clock::now();
++    bool splashHidden = false;
++
++    void hideSplashAfterFirstPresent() {
++        if (splashHidden) {
++            return;
++        }
++
++        splashHidden = true;
++        sceSystemServiceHideSplashScreen();
++        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - programStart).count();
++        fprintf(stderr, "[dk64 start] first frame presented, splash hidden (%.1f s after start)\n", seconds);
++    }
++}
++#endif
++
+ namespace RT64 {
+     // PresentQueue
+ 
+@@ -354,6 +380,16 @@ namespace RT64 {
+                     drawHook(commandList, swapChainFramebuffer);
+                 }
+ 
++                // Frame statistics and the performance overlay, over the game and the menus.
++                if ((performanceOverlay == nullptr) && (ext.createdGraphicsAPI == UserConfiguration::GraphicsAPI::Vulkan)) {
++                    performanceOverlay = std::make_unique<PerformanceOverlay>(ext.device, ext.swapChain);
++                }
++
++                if (performanceOverlay != nullptr) {
++                    performanceOverlay->recordPresent(i == 0, targetRate);
++                    performanceOverlay->draw(commandList, ext.swapChain->getWidth(), ext.swapChain->getHeight());
++                }
++
+                 {
+                     const std::scoped_lock lock(inspectorMutex);
+                     if (inspector != nullptr) {
+@@ -402,6 +438,11 @@ namespace RT64 {
+                 RenderCommandSemaphore *waitSemaphore = drawSemaphores[swapChainIndex].get();
+                 presentTimestamp = Timer::current();
+                 swapChainValid = ext.swapChain->present(swapChainIndex, &waitSemaphore, 1);
++#if defined(__PROSPERO__)
++                if (swapChainValid) {
++                    hideSplashAfterFirstPresent();
++                }
++#endif
+                 presentProfiler.logAndRestart();
+             }
+         }
+diff --git a/src/hle/rt64_present_queue.h b/src/hle/rt64_present_queue.h
+index e08b02c..3a54bbb 100644
+--- a/src/hle/rt64_present_queue.h
++++ b/src/hle/rt64_present_queue.h
+@@ -6,6 +6,7 @@
+ 
+ #include "common/rt64_profiling_timer.h"
+ #include "gui/rt64_inspector.h"
++#include "gui/rt64_performance_overlay.h"
+ #include "render/rt64_vi_renderer.h"
+ 
+ #include "rt64_application_window.h"
+@@ -53,6 +54,8 @@ namespace RT64 {
+         std::vector<std::unique_ptr<RenderCommandSemaphore>> drawSemaphores;
+         std::unique_ptr<VIRenderer> viRenderer;
+         std::unique_ptr<Inspector> inspector;
++        // Frame statistics for the log, and the overlay when it's switched on (Vulkan only).
++        std::unique_ptr<PerformanceOverlay> performanceOverlay;
+         ProfilingTimer presentProfiler = ProfilingTimer(120);
+         Timestamp presentTimestamp;
+         VIHistory viHistory;
+diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.cpp
+index 721a01e..dce2360 100644
+--- a/src/render/rt64_raster_shader.cpp
++++ b/src/render/rt64_raster_shader.cpp
+@@ -485,10 +485,19 @@ namespace RT64 {
+ 
+         // Spawn the threads that will compile all the pipelines.
+         pipelineThreads.clear();
++#   if defined(__PROSPERO__)
++        // On the PS5 a thread that compiled with RADV crashed when it ended: its thread-local
++        // destructors freed memory of the per-thread heap arena (mspace_free, address in RADV's
++        // region). The pipelines are compiled here, in order, so no such thread ends.
++        for (uint32_t i = 0; i < uint32_t(pipelineThreadCreations.size()); i++) {
++            threadCreatePipelines(i);
++        }
++#   else
+         pipelineThreads.resize(pipelineThreadCreations.size());
+         for (uint32_t i = 0; i < uint32_t(pipelineThreads.size()); i++) {
+             pipelineThreads[i] = std::make_unique<std::thread>(&RasterShaderUber::threadCreatePipelines, this, i);
+         }
++#   endif
+ 
+         // Create the pipelines for post blend operations.
+         std::unique_ptr<RenderShader> postBlendAddPixelShader;

@@ -1,0 +1,545 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b89d4c8..6c4fd58 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4,7 +4,10 @@ if(NOT DEFINED ENV{VCPKG_ROOT})
+     set(ENV{VCPKG_ROOT} ${CMAKE_SOURCE_DIR}/lib/vcpkg)
+ endif()
+ 
+-include($ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake)
++# The PS5 build has no vcpkg (lib/vcpkg is not checked out): its libraries come from the PacBrew sysroot.
++if(EXISTS $ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake)
++    include($ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake)
++endif()
+ 
+ if (APPLE)
+     set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum OS X deployment version")
+@@ -310,6 +313,15 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+     target_link_libraries(DK64Recompiled PRIVATE "-latomic -static-libstdc++" ${CMAKE_DL_LIBS} Threads::Threads)
+ endif()
+ 
++if (PS5)
++    # The PS5 port's start-up (log, crash reports, SDL video driver): ps5/ next to src-upstream.
++    target_sources(DK64Recompiled PRIVATE "${DK64_PS5_DIR}/ps5_platform.cpp")
++    target_include_directories(DK64Recompiled PRIVATE "${DK64_PS5_DIR}")
++    # SDL2 and FreeType from the PacBrew sysroot: ps5/link-title.sh links each -l name as its archive there.
++    find_package(Freetype REQUIRED)
++    target_link_libraries(DK64Recompiled PRIVATE ${FREETYPE_LIBRARIES} SDL2)
++endif()
++
+ # TODO fix the rt64 CMake script so that this doesn't need to be duplicated here
+ # For DXC
+ set (DXC_COMMON_OPTS "-I${PROJECT_SOURCE_DIR}/src")
+diff --git a/src/game/config.cpp b/src/game/config.cpp
+index 532c113..8c2a7b0 100644
+--- a/src/game/config.cpp
++++ b/src/game/config.cpp
+@@ -22,6 +22,13 @@
+ #include "apple/rt64_apple.h"
+ #endif
+ 
++#if defined(__PROSPERO__)
++// PS5: no gyro from the SDL joystick driver and no mouse. The options stay (the game reads them) but are hidden.
++static constexpr bool ps5_hidden = true;
++#else
++static constexpr bool ps5_hidden = false;
++#endif
++
+ static void add_general_options(recomp::config::Config &config) {
+     using EnumOptionVector = const std::vector<recomp::config::ConfigOptionEnumOption>;
+ 
+@@ -60,7 +67,8 @@ static void add_general_options(recomp::config::Config &config) {
+         "Invert Gyro",
+         "Inverts gyro controls.",
+         gyro_invert_mode_options,
+-        dk64::CameraInvertMode::InvertY
++        dk64::CameraInvertMode::InvertY,
++        ps5_hidden
+     );
+ 
+     static EnumOptionVector mouse_invert_mode_options = {
+@@ -74,7 +82,8 @@ static void add_general_options(recomp::config::Config &config) {
+         "Invert Mouse",
+         "Inverts Mouse controls.",
+         mouse_invert_mode_options,
+-        dk64::CameraInvertMode::InvertY
++        dk64::CameraInvertMode::InvertY,
++        ps5_hidden
+     );
+     static EnumOptionVector swimming_invert_options = {
+         {dk64::CameraInvertMode::InvertNone, "InvertNone", "None"},
+@@ -114,7 +123,12 @@ static void add_general_options(recomp::config::Config &config) {
+         "Camera Type",
+         "Changes the camera behavior.<br /><recomp-color primary>Free Cam</recomp-color>: Camera can be controlled via pressing C-Left and C-Right. The camera does not try to push itself behind the player.<br /><recomp-color primary>Follow Cam</recomp-color>: Similar to <recomp-color secondary>Free Cam</recomp-color>, but the camera tries to push itself behind the player.<br /><recomp-color primary>Better Free Cam</recomp-color>: Similar to <recomp-color secondary>Free Cam</recomp-color>, but instead of a button press turning the camera 45 degrees, holding the button moves the camera at 5 degrees per frame.<br /><recomp-color primary>Analog Camera</recomp-color>: Control of the camera is controlled by your right analogue stick. It is advised that C-Up is remapped to something outside your right analogue stick in order to have a good time with this.",
+         camera_type_options,
++#if defined(__PROSPERO__)
++        // The PS5 port starts with Follow Cam.
++        dk64::CameraTypeMode::Follow
++#else
+         dk64::CameraTypeMode::Free
++#endif
+     );
+     config.add_number_option(
+         dk64::configkeys::general::analog_camera_sensitivity,
+@@ -205,10 +219,12 @@ T get_graphics_config_number_value(const std::string& option_id) {
+     return static_cast<T>(std::get<double>(recompui::config::get_graphics_config().get_option_value(option_id)));
+ }
+ 
++#if !defined(__PROSPERO__)
+ template <typename T = uint32_t>
+ T get_technical_config_enum_value(const std::string& option_id) {
+     return static_cast<T>(std::get<uint32_t>(recompui::config::get_config("technical").get_option_value(option_id)));
+ }
++#endif
+ 
+ static void add_sound_options(recomp::config::Config &config) {
+     config.add_percent_number_option(
+@@ -267,6 +283,7 @@ int dk64::get_draw_distance() {
+     return get_graphics_config_number_value<int>(dk64::configkeys::graphics::draw_distance);
+ }
+ 
++#if !defined(__PROSPERO__)
+ static void add_technical_options(recomp::config::Config &config) {
+     using EnumOptionVector = const std::vector<recomp::config::ConfigOptionEnumOption>;
+     // Multiplayer
+@@ -282,9 +299,15 @@ static void add_technical_options(recomp::config::Config &config) {
+         dk64::MultiplayerEnabled::Off
+     );
+ }
++#endif
+ 
+ dk64::MultiplayerEnabled dk64::get_multiplayer_enabled() {
++#if defined(__PROSPERO__)
++    // No Technical tab on the PS5 (dk64::init_config), so multiplayer stays locked.
++    return dk64::MultiplayerEnabled::Off;
++#else
+     return get_technical_config_enum_value<dk64::MultiplayerEnabled>(dk64::configkeys::technical::multiplayer_enabled);
++#endif
+ }
+ 
+ static void set_control_defaults() {
+@@ -376,8 +399,11 @@ void dk64::init_config() {
+     auto &sound_config = recompui::config::create_sound_tab();
+     add_sound_options(sound_config);
+ 
++#if !defined(__PROSPERO__)
++    // The tab's only option unlocks upstream's unfinished multiplayer, so the PS5 has no Technical tab.
+     auto &technical_config = recompui::config::create_config_tab("Technical", "technical", true);
+     add_technical_options(technical_config);
++#endif
+ 
+     recompui::config::create_mods_tab();
+ 
+diff --git a/src/main/launcher_animation.cpp b/src/main/launcher_animation.cpp
+index 01691db..a300d61 100644
+--- a/src/main/launcher_animation.cpp
++++ b/src/main/launcher_animation.cpp
+@@ -1,6 +1,12 @@
+ #include "donk_launcher.h"
+ #include <atomic>
+-#include <cstdio> 
++#include <cstdio>
++#if defined(__PROSPERO__)
++#include <fstream>
++#include <iterator>
++#include <vector>
++#include "elements/ui_image.h"
++#endif
+ 
+ struct KeyframeRot {
+     float seconds;
+@@ -50,6 +56,10 @@ struct LauncherContext {
+     recompui::Element *wrapper;
+     recompui::Element *water;
+     recompui::Label *credits_label;
++#if defined(__PROSPERO__)
++    // The home screen's background picture, shown instead of the scene (dk64::launcher_animation_setup).
++    recompui::Element *background_image = nullptr;
++#endif
+     float wrapper_phase = -1.0f;
+     std::chrono::steady_clock::time_point last_update_time;
+     float seconds = 0.0f;
+@@ -128,6 +138,12 @@ AnimatedSvg create_animated_svg(recompui::ContextId context, recompui::Element *
+ }
+ 
+ void update_animated_svg(AnimatedSvg &animated_svg, float delta_time, float bg_width, float bg_height) {
++#if defined(__PROSPERO__)
++    // The scene's pictures aren't made when the background picture replaces them.
++    if (animated_svg.svg == nullptr) {
++        return;
++    }
++#endif
+     float position_x = 0.0f, position_y = 0.0f;
+     float scale_x = 1.0f, scale_y = 1.0f;
+     float rotation_degrees = 0.0f;
+@@ -176,6 +192,31 @@ const float jiggy_move_over_end = jiggy_move_over_start + jiggy_move_over_length
+ 
+ const float animation_skip_time = 10.0f;
+ 
++#if defined(__PROSPERO__)
++// On the PS5 the launcher is the ROM screen. It shows the home screen's background picture (assets/rom-screen.png,
++// a 1920x1080 PNG of the picture in sce_sys/pic0.dds) instead of the launcher's scene, under the launcher's own
++// animated logo. Without the file, the scene is drawn as before. The image's name starts with "?/", as the
++// frontend's own thumbnails do: any other name is taken as a path in the assets folder ("/app0/assets/<name>"),
++// which isn't the name the bytes were queued under, so the image stays an empty placeholder.
++static recompui::Element *ps5_background_image(recompui::ContextId context, recompui::Element *parent) {
++    std::ifstream file("/app0/assets/rom-screen.png", std::ios::binary);
++    std::vector<char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++    if (bytes.empty()) {
++        fprintf(stderr, "[dk64] no assets/rom-screen.png: the ROM screen draws the launcher's scene\n");
++        return nullptr;
++    }
++    fprintf(stderr, "[dk64] ROM screen background: assets/rom-screen.png, %zu bytes\n", bytes.size());
++    recompui::queue_image_from_bytes_file("?/ps5/rom-screen", bytes);
++    recompui::Element *image = context.create_element<recompui::Image>(parent, "?/ps5/rom-screen");
++    image->set_position(recompui::Position::Absolute);
++    image->set_top(0);
++    image->set_left(0);
++    image->set_width(100, recompui::Unit::Percent);
++    image->set_height(100, recompui::Unit::Percent);
++    return image;
++}
++#endif
++
+ void dk64::launcher_animation_setup(recompui::LauncherMenu *menu) {
+     auto context = recompui::get_current_context();
+     recompui::Element *background_container = menu->get_background_container();
+@@ -200,12 +241,19 @@ void dk64::launcher_animation_setup(recompui::LauncherMenu *menu) {
+     }
+ 
+     // The creation order of these is important.
+-    
++
++#if defined(__PROSPERO__)
++    launcher_context.background_image = ps5_background_image(context, background_container);
++    if (launcher_context.background_image == nullptr) {
++#endif
+     launcher_context.bg_svg = create_animated_svg(context, launcher_context.wrapper, "bg.svg", 1920.0f, 1920.0f);
+     launcher_context.cloud_svgs[0] = create_animated_svg(context, background_container, "Cloud1.svg", 461.0f, 154.0f);
+     launcher_context.cloud_svgs[1] = create_animated_svg(context, background_container, "Cloud3.svg", 295.0f, 167.0f);
+     launcher_context.cloud_svgs[2] = create_animated_svg(context, background_container, "Cloud1.svg", 461.0f, 154.0f);
+     launcher_context.isles_svg = create_animated_svg(context, launcher_context.wrapper, "DkIsles.svg", 1920.0f, 1920.0f);
++#if defined(__PROSPERO__)
++    }
++#endif
+ 
+     launcher_context.logo_64_svg = create_animated_svg(context, background_container, "logo_64.svg", 336, 283);
+     launcher_context.logo_k_svg = create_animated_svg(context, background_container, "logo_k.svg", 267, 304);
+@@ -338,11 +386,17 @@ void dk64::launcher_animation_setup(recompui::LauncherMenu *menu) {
+     launcher_context.logo_recomp_svg.opacity_animation.interpolation_method = InterpolationMethod::Smootherstep;
+ 
+ 
++#if defined(__PROSPERO__)
++    if (launcher_context.background_image == nullptr) {
++#endif
+     launcher_context.water = context.create_element<recompui::Element>(background_container, 0);
+     launcher_context.water->set_position(recompui::Position::Absolute);
+     launcher_context.water->set_width(100, recompui::Unit::Percent);
+     launcher_context.water->set_height(100, recompui::Unit::Percent);
+     launcher_context.water->set_background_color({ 0x00, 0x66, 0xCC, 0x7F});
++#if defined(__PROSPERO__)
++    }
++#endif
+ 
+     launcher_context.credits_label = context.create_element<recompui::Label>(
+         background_container, 
+@@ -359,6 +413,12 @@ void dk64::launcher_animation_setup(recompui::LauncherMenu *menu) {
+ }
+ 
+ void dk64::launcher_animation_update(recompui::LauncherMenu *menu) {
++#if defined(__PROSPERO__)
++    // Not set up when the game started at once (on_launcher_init in main.cpp).
++    if (launcher_context.wrapper == nullptr) {
++        return;
++    }
++#endif
+     std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+     float delta_time = launcher_context.started ? std::chrono::duration_cast<std::chrono::milliseconds>(now - launcher_context.last_update_time).count() / 1000.0f : 0.0f;
+     if (launcher_context.skip_animation_next_update) {
+@@ -382,12 +442,19 @@ void dk64::launcher_animation_update(recompui::LauncherMenu *menu) {
+     update_animated_svg(launcher_context.logo_k_svg, delta_time, bg_width, bg_height);
+     update_animated_svg(launcher_context.logo_d_svg, delta_time, bg_width, bg_height);
+     update_animated_svg(launcher_context.logo_recomp_svg, delta_time, bg_width, bg_height);
++#if defined(__PROSPERO__)
++    // The background picture stays still (a slow zoom on it was uncomfortable to watch).
++    if (launcher_context.background_image == nullptr) {
++#endif
+     launcher_context.water->set_top(bg_height - 70);
+ 
+     launcher_context.bg_svg.svg->set_top(0);
+     launcher_context.bg_svg.svg->set_width(100, recompui::Unit::Percent);
+     launcher_context.bg_svg.svg->set_width(100, recompui::Unit::Percent);
+-    
++#if defined(__PROSPERO__)
++    }
++#endif
++
+ 
+     float wrapper_phase = std::clamp((launcher_context.seconds - jiggy_move_over_start) / (jiggy_move_over_end - jiggy_move_over_start), 0.0f, 1.0f);
+     if (wrapper_phase != launcher_context.wrapper_phase) {
+diff --git a/src/main/main.cpp b/src/main/main.cpp
+index ae0dc74..113b907 100644
+--- a/src/main/main.cpp
++++ b/src/main/main.cpp
+@@ -57,6 +57,27 @@
+ #include "../../patches/ui.h"
+ #include "../../patches/misc_funcs.h"
+ 
++// Mods built into the game (the PS5 port's mods/ folder, embedded by CMake from src-upstream/mods/*.nrm).
++// They show in the mod menu like mods from the mods folder, with their own switches and settings.
++#if __has_include("mods/dk64_tag_anywhere.h")
++#include "mods/dk64_tag_anywhere.h"
++#define DK64_EMBEDDED_TAG_ANYWHERE 1
++#endif
++#if __has_include("mods/tag_anywhere_sparkles.h")
++#include "mods/tag_anywhere_sparkles.h"
++#define DK64_EMBEDDED_TAG_ANYWHERE_SPARKLES 1
++#endif
++
++#if defined(__PROSPERO__)
++#include <cctype>
++#include "ps5_platform.h"
++// Start-up steps in dk64.log on the PS5, written out at once so a start that stops shows how far it got.
++#define DK64_STEP(...) do { std::fprintf(stderr, "[dk64 start] " __VA_ARGS__); std::fputc('\n', stderr); \
++        dk64::ps5::flush_log(); } while (0)
++#else
++#define DK64_STEP(...) do {} while (0)
++#endif
++
+ namespace {
+ 
+ class PacingRendererContext final : public ultramodern::renderer::RendererContext {
+@@ -223,11 +244,20 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
+ 
+ #if defined(__APPLE__)
+     flags |= SDL_WINDOW_METAL;
+-#elif defined(RT64_SDL_WINDOW_VULKAN)
++#elif defined(RT64_SDL_WINDOW_VULKAN) && !defined(__PROSPERO__)
++    // Not on the PS5: PacBrew's SDL2 is built without Vulkan (SDL_VIDEO_VULKAN unset), so a Vulkan window
++    // fails to create, and plume presents through VK_KHR_display there instead of through the window.
+     flags |= SDL_WINDOW_VULKAN;
+ #endif
+ 
++#if defined(__PROSPERO__)
++    // SDL's offscreen video driver has no display to size a window to. The console's display plane is
++    // 3840x2160, and RT64 presents to it through VK_KHR_display (plume), not through this window.
++    window = SDL_CreateWindow("DK64: Recompiled", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 3840, 2160, flags);
++    fprintf(stderr, "[dk64] window 3840x2160 (the console's display plane)\n");
++#else
+     window = SDL_CreateWindow("DK64: Recompiled", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1600, 900,  flags);
++#endif
+ 
+     if (window == nullptr) {
+         exit_error("Failed to create window: %s\n", SDL_GetError());
+@@ -247,7 +277,7 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
+ 
+ #if defined(_WIN32)
+     return ultramodern::renderer::WindowHandle{ wmInfo.info.win.window, GetCurrentThreadId() };
+-#elif defined(__linux__) || defined(__ANDROID__)
++#elif defined(__linux__) || defined(__ANDROID__) || defined(__PROSPERO__)
+     return ultramodern::renderer::WindowHandle{ window };
+ #elif defined(__APPLE__)
+     SDL_MetalView view = SDL_Metal_CreateView(window);
+@@ -597,7 +627,7 @@ void release_preload(PreloadContext& context) {
+     context = {};
+ }
+ 
+-#elif defined(__linux__) || defined(APPLE)
++#elif defined(__linux__) || defined(APPLE) || defined(__PROSPERO__)
+ 
+ struct PreloadContext {
+ 
+@@ -637,6 +667,61 @@ void reorder_texture_pack(recomp::mods::ModContext&) {
+     recompui::renderer::trigger_texture_pack_update();
+ }
+ 
++#if defined(__PROSPERO__)
++// Set by main's ROM search, before the UI (and the launcher in it) is made: whether the game has a ROM, and the
++// first ROM file found in the title folder that librecomp refused, and why.
++static bool ps5_rom_found = false;
++static std::string ps5_refused_rom;
++static recomp::RomValidationError ps5_refused_rom_error = recomp::RomValidationError::Good;
++
++// The launcher's message on the PS5, where it only shows when no usable ROM was found: where the ROM goes. The
++// whole options menu (the message, then Exit) is one dark card, so the text and Exit's pulsing highlight stay
++// readable over the background picture.
++static void add_ps5_rom_message(recompui::GameOptionsMenu *menu) {
++    auto context = recompui::get_current_context();
++    menu->set_background_color({ 0x00, 0x00, 0x00, 0xE0 });
++    menu->set_border_radius(16.0f);
++    menu->set_padding_bottom(16.0f);
++    recompui::Element *panel = context.create_element<recompui::Element>(menu, 0);
++    panel->set_display(recompui::Display::Flex);
++    panel->set_flex_direction(recompui::FlexDirection::Column);
++    panel->set_gap(16.0f);
++    panel->set_padding(32.0f);
++    panel->set_width(100.0f, recompui::Unit::Percent);
++
++    auto *title = context.create_element<recompui::Label>(panel,
++        ps5_refused_rom.empty() ? "ROM not found" : "This ROM can't be used", recompui::theme::Typography::Header2);
++    title->set_font_family("Suplexmentary Comic NC");
++
++    // Each line, and whether it's a path (shown larger, in the theme's colour).
++    std::vector<std::pair<std::string, bool>> lines;
++    if (!ps5_refused_rom.empty()) {
++        const char *reason = "it couldn't be used";
++        switch (ps5_refused_rom_error) {
++            case recomp::RomValidationError::IncorrectVersion: reason = "it's another version of Donkey Kong 64"; break;
++            case recomp::RomValidationError::IncorrectRom: reason = "it isn't Donkey Kong 64"; break;
++            case recomp::RomValidationError::NotARom: reason = "it isn't an N64 ROM"; break;
++            case recomp::RomValidationError::FailedToOpen: reason = "it couldn't be read"; break;
++            default: break;
++        }
++        lines.push_back({ ps5_refused_rom + " is in the game's folder, but " + reason + ".", false });
++    }
++    // The title folder's name only: the game can be installed on the console's storage, a USB drive or M.2 storage,
++    // and a title can't see which (it sees its folder as /app0).
++    lines.push_back({ "Copy your Donkey Kong 64 ROM into the game's folder, next to eboot.bin:", false });
++    lines.push_back({ "PPSA64064", true });
++    lines.push_back({ "It has to be the USA version (1.0), as a .z64, .n64 or .v64 file. Then start the game again.", false });
++    for (const auto& [text, path] : lines) {
++        auto *label = context.create_element<recompui::Label>(panel, text,
++            path ? recompui::theme::Typography::LabelLG : recompui::theme::Typography::Body);
++        label->set_white_space(recompui::WhiteSpace::Normal);
++        if (path) {
++            label->set_color(recompui::theme::color::Primary);
++        }
++    }
++}
++#endif
++
+ void on_launcher_init(recompui::LauncherMenu *menu) {
+     auto game_options_menu = menu->init_game_options_menu(
+         supported_games[0].game_id,
+@@ -646,8 +731,22 @@ void on_launcher_init(recompui::LauncherMenu *menu) {
+         recompui::GameOptionsMenuLayout::Center
+     );
+ 
++#if defined(__PROSPERO__)
++    // main starts the game at once when it finds the ROM, so on the PS5 the launcher only shows without one (it's
++    // still made at every start). Its options can't help there (no file dialog to load a ROM with): it says where
++    // the ROM goes, and offers Exit.
++    if (!ps5_rom_found) {
++        add_ps5_rom_message(game_options_menu);
++    }
++    recompui::GameOption *exit_option = game_options_menu->add_exit_option();
++    exit_option->set_as_primary_focus(true);
++    recompui::get_current_context().set_autofocus_element(exit_option);
++    // Wider than upstream's 30%, for the message; it still clears DK Isles on the left.
++    game_options_menu->set_width(45, recompui::Unit::Percent);
++#else
+     game_options_menu->add_default_options();
+     game_options_menu->set_width(30, recompui::Unit::Percent);
++#endif
+ 
+     for (auto option : game_options_menu->get_options()) {
+         option->set_justify_content(recompui::JustifyContent::FlexEnd);
+@@ -674,6 +773,13 @@ void on_launcher_init(recompui::LauncherMenu *menu) {
+ 
+     menu->remove_default_title();
+ 
++#if defined(__PROSPERO__)
++    // With a ROM the game starts at once and the launcher never shows: its scene (and the background picture
++    // the PS5's has) isn't loaded.
++    if (ps5_rom_found) {
++        return;
++    }
++#endif
+     dk64::launcher_animation_setup(menu);
+ }
+ 
+@@ -682,6 +788,11 @@ void on_launcher_init(recompui::LauncherMenu *menu) {
+ int main(int argc, char** argv) {
+     (void)argc;
+     (void)argv;
++#if defined(__PROSPERO__)
++    // The log in the title folder (/app0/dk64.log), crash reports with a backtrace, SDL's offscreen video driver.
++    dk64::ps5::init();
++    DK64_STEP("main: log open, DK64: Recompiled %s for the PS5", version_string.c_str());
++#endif
+     recomp::Version project_version{};
+     if (!recomp::Version::from_string(version_string, project_version)) {
+         ultramodern::error_handling::message_box(("Invalid version string: " + version_string).c_str());
+@@ -757,11 +868,14 @@ int main(int argc, char** argv) {
+     recompui::programconfig::set_program_id(dk64::program_id);
+     
+     // Initialize SDL audio and set the output frequency.
++    DK64_STEP("opening audio");
+     SDL_InitSubSystem(SDL_INIT_AUDIO);
+     if (!reset_audio(48000)) {
+         // It is not possible to initialize without an audio device.
++        DK64_STEP("no audio device: %s", SDL_GetError());
+         return EXIT_FAILURE;
+     }
++    DK64_STEP("audio open");
+ 
+     // Source controller mappings file
+     std::u8string controller_db_path = (recompui::file::get_program_path() / "recompcontrollerdb.txt").u8string();
+@@ -873,6 +987,57 @@ int main(int argc, char** argv) {
+     // Register the .rtz texture pack file format with the previous content type as its only allowed content type.
+     recomp::mods::register_mod_container_type("rtz", std::vector{ texture_pack_content_type_id }, false);
+ 
++    // Mods built into the game, opened with the mods folder's when the game scans for mods.
++#if defined(DK64_EMBEDDED_TAG_ANYWHERE)
++    recomp::mods::register_embedded_mod("dk64_tag_anywhere",
++        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(dk64_tag_anywhere), dk64_tag_anywhere_size));
++#endif
++#if defined(DK64_EMBEDDED_TAG_ANYWHERE_SPARKLES)
++    recomp::mods::register_embedded_mod("tag_anywhere_sparkles",
++        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(tag_anywhere_sparkles), tag_anywhere_sparkles_size));
++#endif
++
++#if defined(__PROSPERO__)
++    // No launcher on the PS5 (it has no file dialog to pick a ROM with): the ROM is the copy stored by an
++    // earlier start, else the first .z64, .n64 or .v64 file in the title folder that librecomp accepts,
++    // and the game starts at once with the settings as they are (defaults on the first start).
++    bool ps5_rom = false;
++    {
++        const std::u8string id{ supported_games[0].game_id };
++        recomp::check_all_stored_roms();
++        ps5_rom = recomp::is_rom_valid(id);
++        std::error_code ec;
++        for (const auto& entry : std::filesystem::directory_iterator("/app0", ec)) {
++            if (ps5_rom) {
++                break;
++            }
++            std::string ext = entry.path().extension().string();
++            for (char& c : ext) {
++                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++            }
++            if (ext != ".z64" && ext != ".n64" && ext != ".v64") {
++                continue;
++            }
++            const recomp::RomValidationError result = recomp::select_rom(entry.path(), id);
++            fprintf(stderr, "[dk64] %s: %s\n", entry.path().string().c_str(),
++                result == recomp::RomValidationError::Good ? "imported" : "not the US 1.0 ROM");
++            ps5_rom = result == recomp::RomValidationError::Good;
++            if (!ps5_rom && ps5_refused_rom.empty()) {
++                ps5_refused_rom = entry.path().filename().string();
++                ps5_refused_rom_error = result;
++            }
++        }
++        if (!ps5_rom) {
++            fprintf(stderr, "[dk64] no Donkey Kong 64 (USA) ROM in the title folder\n");
++        }
++    }
++    ps5_rom_found = ps5_rom;
++    DK64_STEP("game registered; ROM %s", ps5_rom ? "ready" : "missing");
++    if (ps5_rom) {
++        recomp::start_game(supported_games[0].game_id, {});
++    }
++#endif
++
+     recomp::Configuration cfg {
+         .argc = argc,
+         .argv = argv,
+@@ -891,7 +1056,9 @@ int main(int argc, char** argv) {
+         },
+     };
+ 
++    DK64_STEP("recomp::start (window, renderer, game thread)");
+     recomp::start(cfg);
++    DK64_STEP("recomp::start returned");
+ 
+     NFD_Quit();
+ 

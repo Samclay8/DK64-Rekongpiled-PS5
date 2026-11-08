@@ -1,0 +1,722 @@
+diff --git a/recompinput/src/input_mapping.cpp b/recompinput/src/input_mapping.cpp
+index bfcfef4..02b7666 100644
+--- a/recompinput/src/input_mapping.cpp
++++ b/recompinput/src/input_mapping.cpp
+@@ -54,7 +54,12 @@ namespace recompinput {
+         { GameInput::Y_AXIS_POS,     { InputField::controller_analog( SDL_CONTROLLER_AXIS_LEFTY, false) } },
+         { GameInput::Y_AXIS_NEG,     { InputField::controller_analog( SDL_CONTROLLER_AXIS_LEFTY, true) } },
+ 
++#if defined(__PROSPERO__)
++        // The PS5 keeps the Create (Back) and PS (Guide) buttons for itself; the touchpad click opens the menu.
++        { GameInput::TOGGLE_MENU,    { InputField::controller_digital(SDL_CONTROLLER_BUTTON_TOUCHPAD) } },
++#else
+         { GameInput::TOGGLE_MENU,    { InputField::controller_digital(SDL_CONTROLLER_BUTTON_BACK) } },
++#endif
+         { GameInput::ACCEPT_MENU,    { InputField::controller_digital(SDL_CONTROLLER_BUTTON_SOUTH) } },
+         { GameInput::BACK_MENU,      { InputField::controller_digital(SDL_CONTROLLER_BUTTON_WEST) } },
+         { GameInput::APPLY_MENU,     { InputField::controller_digital(SDL_CONTROLLER_BUTTON_NORTH), InputField::controller_digital(SDL_CONTROLLER_BUTTON_START) } },
+diff --git a/recompinput/src/input_types.cpp b/recompinput/src/input_types.cpp
+index c6786e6..69ed329 100644
+--- a/recompinput/src/input_types.cpp
++++ b/recompinput/src/input_types.cpp
+@@ -86,6 +86,31 @@ const std::string& get_game_input_enum_name(GameInput input) {
+ }
+ 
+ static std::string controller_button_to_string(SDL_GameControllerButton button) {
++#if defined(__PROSPERO__)
++    // The PS5's only controller is the DualSense: PlayStation glyphs (SDL's A/B/X/Y are positions, so A is Cross).
++    switch (button) {
++    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_A:
++        return PF_SONY_A;
++    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_B:
++        return PF_SONY_B;
++    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_X:
++        return PF_SONY_X;
++    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_Y:
++        return PF_SONY_Y;
++    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_BACK:
++        return PF_SONY_DUALSENSE_SHARE;
++    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_START:
++        return PF_SONY_DUALSENSE_OPTIONS;
++    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_LEFTSHOULDER:
++        return PF_SONY_LEFT_SHOULDER;
++    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_RIGHTSHOULDER:
++        return PF_SONY_RIGHT_SHOULDER;
++    case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_TOUCHPAD:
++        return PF_SONY_DUALSENSE_TOUCHPAD;
++    default:
++        break;
++    }
++#endif
+     switch (button) {
+     case SDL_GameControllerButton::SDL_CONTROLLER_BUTTON_A:
+         return PF_GAMEPAD_A;
+@@ -239,10 +264,17 @@ static std::string controller_axis_to_string(int axis) {
+         return positive ? PF_ANALOG_R_RIGHT : PF_ANALOG_R_LEFT;
+     case SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_RIGHTY:
+         return positive ? PF_ANALOG_R_DOWN : PF_ANALOG_R_UP;
++#if defined(__PROSPERO__)
++    case SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_TRIGGERLEFT:
++        return PF_SONY_LEFT_TRIGGER;
++    case SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_TRIGGERRIGHT:
++        return PF_SONY_RIGHT_TRIGGER;
++#else
+     case SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_TRIGGERLEFT:
+         return positive ? PF_XBOX_LEFT_TRIGGER : PF_XBOX_LEFT_TRIGGER_PULL;
+     case SDL_GameControllerAxis::SDL_CONTROLLER_AXIS_TRIGGERRIGHT:
+         return positive ? PF_XBOX_RIGHT_TRIGGER : PF_XBOX_RIGHT_TRIGGER_PULL;
++#endif
+     default:
+         return recompinput::unknown_device_input;
+         //! Does not render correctly. Have not encountered any unknown axis yet.
+diff --git a/recompui/include/recompui/config.h b/recompui/include/recompui/config.h
+index fd04cb3..d481669 100644
+--- a/recompui/include/recompui/config.h
++++ b/recompui/include/recompui/config.h
+@@ -61,6 +61,7 @@ namespace recompui {
+                 inline const std::string hpfb_option = "hpfb_option";
+                 inline const std::string rr_manual_value = "rr_manual_value";
+                 inline const std::string ds_option = "ds_option";
++                inline const std::string perf_overlay_option = "perf_overlay_option";
+             }
+     
+             void update_msaa_supported(bool supported);
+diff --git a/recompui/include/recompui/recompui.h b/recompui/include/recompui/recompui.h
+index 30c463b..b14a94b 100644
+--- a/recompui/include/recompui/recompui.h
++++ b/recompui/include/recompui/recompui.h
+@@ -90,6 +90,10 @@ namespace recompui {
+     void close_prompt();
+     bool is_prompt_open();
+     void update_mod_list(bool scan_mods = true);
++    // For code that runs while another UI context is open (a prompt's buttons), where update_mod_list can't
++    // open the menu's context: the mod list is refreshed the next time the menu opens instead.
++    void mark_mod_list_stale();
++    bool take_mod_list_stale();
+     void process_game_started();
+ 
+     void apply_color_hack();
+diff --git a/recompui/src/base/ui_state.cpp b/recompui/src/base/ui_state.cpp
+index 277a421..be2d899 100644
+--- a/recompui/src/base/ui_state.cpp
++++ b/recompui/src/base/ui_state.cpp
+@@ -510,7 +510,7 @@ inline const std::string read_file_to_string(std::filesystem::path path) {
+ }
+ 
+ void init_hook(plume::RenderInterface* interface, plume::RenderDevice* device) {
+-#if defined(__linux__)
++#if defined(__linux__) || defined(__PROSPERO__)
+     std::locale::global(std::locale::classic());
+ #endif
+     ui_state = std::make_unique<UIState>(window, interface, device);
+diff --git a/recompui/src/composites/ui_mod_details_panel.cpp b/recompui/src/composites/ui_mod_details_panel.cpp
+index 88291e2..5de313a 100644
+--- a/recompui/src/composites/ui_mod_details_panel.cpp
++++ b/recompui/src/composites/ui_mod_details_panel.cpp
+@@ -69,6 +69,11 @@ ModDetailsPanel::ModDetailsPanel(ResourceId rid, Element *parent) : Element(rid,
+ 
+             enable_label = context.create_element<Label>(enable_container, "", LabelStyle::Annotation);
+             enable_label->set_color(theme::color::Primary);
++
++            // PS5: a code mod switched while the game runs applies on the next start (ModMenu::mod_selected).
++            restart_label = context.create_element<Label>(enable_container, "Change requires game restart", LabelStyle::Annotation);
++            restart_label->set_color(theme::color::Danger);
++            restart_label->set_display(Display::None);
+         }
+ 
+         configure_button = context.create_element<Button>(buttons_container, "Configure", recompui::ButtonStyle::Secondary);
+@@ -83,6 +88,10 @@ void ModDetailsPanel::disable_toggle() {
+     enable_toggle->set_enabled(false);
+ }
+ 
++void ModDetailsPanel::set_restart_note_visible(bool visible) {
++    restart_label->set_display(visible ? Display::Block : Display::None);
++}
++
+ void ModDetailsPanel::set_mod_details(const recomp::mods::ModDetails& details, const std::string &thumbnail, bool toggle_checked, bool toggle_enabled, bool toggle_label_visible, bool configure_enabled, recomp::mods::DeprecationStatus deprecation_status) {
+     cur_details = details;
+ 
+diff --git a/recompui/src/composites/ui_mod_details_panel.h b/recompui/src/composites/ui_mod_details_panel.h
+index 2617283..cc5732f 100644
+--- a/recompui/src/composites/ui_mod_details_panel.h
++++ b/recompui/src/composites/ui_mod_details_panel.h
+@@ -21,6 +21,7 @@ public:
+     Toggle* get_enable_toggle() { return enable_toggle; }
+     Button* get_configure_button() { return configure_button; }
+     void disable_toggle();
++    void set_restart_note_visible(bool visible);
+ protected:
+     std::string_view get_type_name() override { return "ModDetailsPanel"; }
+ private:
+@@ -38,6 +39,7 @@ private:
+     Container *enable_container = nullptr;
+     Toggle *enable_toggle = nullptr;
+     Label *enable_label = nullptr;
++    Label *restart_label = nullptr;
+     Button *configure_button = nullptr;
+     std::function<void(bool)> mod_toggled_callback = nullptr;
+     std::function<void()> mod_configure_pressed_callback = nullptr;
+diff --git a/recompui/src/composites/ui_mod_installer.cpp b/recompui/src/composites/ui_mod_installer.cpp
+index 1f98b3c..af59552 100644
+--- a/recompui/src/composites/ui_mod_installer.cpp
++++ b/recompui/src/composites/ui_mod_installer.cpp
+@@ -15,6 +15,10 @@ namespace recompui {
+         return file_path.extension() == ".so" || file_path.filename().string().find(".so.") != std::string::npos;
+ #elif defined(__APPLE__)
+         return file_path.extension() == ".dylib";
++#elif defined(__PROSPERO__)
++        // Native code mods cannot be loaded into a title.
++        (void)file_path;
++        return false;
+ #else
+         static_assert(false, "Unimplemented for this platform.");
+ #endif
+diff --git a/recompui/src/composites/ui_mod_menu.cpp b/recompui/src/composites/ui_mod_menu.cpp
+index 39a7abc..4e6e4ff 100644
+--- a/recompui/src/composites/ui_mod_menu.cpp
++++ b/recompui/src/composites/ui_mod_menu.cpp
+@@ -26,7 +26,32 @@ static std::string generate_thumbnail_src_for_mod(const std::string &mod_id) {
+     return "?/mods/" + mod_id + "/thumb";
+ }
+ 
++#if defined(__PROSPERO__)
++// PS5: code mods can't change while the game runs, and there's no launcher to change them before it starts.
++// Their switches stay usable: changes wait for the next start, and leaving the Manage Mods tab or closing the
++// menu offers to quit the game (config::create_mods_tab).
++static constexpr bool toggle_with_restart = true;
++#else
++static constexpr bool toggle_with_restart = false;
++#endif
++
++// While the game runs on the PS5, the switches show the next start: the pending changes, and the mods those
++// need (on and locked, as on other platforms), so the menu never shows a mod on without one it depends on.
++static bool use_next_start_view() {
++    return toggle_with_restart && ultramodern::is_game_started();
++}
++
++static bool is_mod_required(const std::string &mod_id) {
++    if (use_next_start_view()) {
++        return recomp::mods::is_mod_required_next_start(mod_id);
++    }
++    return recomp::mods::is_mod_auto_enabled(mod_id);
++}
++
+ static bool is_mod_enabled_or_auto(const std::string &mod_id) {
++    if (use_next_start_view()) {
++        return recomp::mods::is_mod_enabled_next_start(mod_id) || recomp::mods::is_mod_required_next_start(mod_id);
++    }
+     return recomp::mods::is_mod_enabled(mod_id) || recomp::mods::is_mod_auto_enabled(mod_id);
+ }
+ 
+@@ -295,6 +320,9 @@ void ModMenu::open_mods_folder() {
+ #elif defined(__linux__)
+     std::string command = "xdg-open \"" + mods_directory.string() + "\" &";
+     std::system(command.c_str());
++#elif defined(__PROSPERO__)
++    // No file browser on the PS5: the mods folder is reached over FTP.
++    (void)mods_directory;
+ #elif defined(__APPLE__)
+     std::string command = "open \"" + mods_directory.string() + "\"";
+     std::system(command.c_str());
+@@ -319,7 +347,13 @@ void ModMenu::open_install_dialog() {
+ 
+ void ModMenu::mod_toggled(bool enabled) {
+     if (active_mod_index >= 0) {
+-        recomp::mods::enable_mod(mod_details[active_mod_index].mod_id, enabled);
++        const recomp::mods::ModDetails &details = mod_details[active_mod_index];
++        if (toggle_with_restart && !details.runtime_toggleable && ultramodern::is_game_started()) {
++            recomp::mods::set_next_start_change(details.mod_id, enabled);
++        }
++        else {
++            recomp::mods::enable_mod(mod_details[active_mod_index].mod_id, enabled);
++        }
+         
+         // Refresh enabled status for all mods in case one of them got auto-enabled due to being a dependency.
+         for (size_t i = 0; i < mod_entry_buttons.size(); i++) {
+@@ -339,12 +373,15 @@ void ModMenu::mod_selected(uint32_t mod_index) {
+         std::string thumbnail_src = generate_thumbnail_src_for_mod(mod_details[mod_index].mod_id);
+         const recomp::config::ConfigSchema &config_schema = recomp::mods::get_mod_config_schema(mod_details[active_mod_index].mod_id);
+         bool toggle_checked = is_mod_enabled_or_auto(mod_details[mod_index].mod_id);
+-        bool auto_enabled = recomp::mods::is_mod_auto_enabled(mod_details[mod_index].mod_id);
++        bool auto_enabled = is_mod_required(mod_details[mod_index].mod_id);
+         recomp::mods::DeprecationStatus deprecation_status = recomp::mods::get_mod_deprecation_status(mod_details[mod_index].mod_id);
+         bool deprecated = recomp::mods::is_mod_deprecated(mod_details[mod_index].mod_id, mod_details[mod_index].version);
+-        bool toggle_enabled = !auto_enabled && !deprecated && (mod_details[mod_index].runtime_toggleable || !ultramodern::is_game_started());
++        bool toggle_enabled = !auto_enabled && !deprecated && (mod_details[mod_index].runtime_toggleable || !ultramodern::is_game_started() || toggle_with_restart);
+         bool configure_enabled = !config_schema.options.empty();
+         mod_details_panel->set_mod_details(mod_details[mod_index], thumbnail_src, toggle_checked, toggle_enabled, auto_enabled || deprecated, configure_enabled, deprecation_status);
++        // A code mod can't change in the running game: say so before it's switched. Not when the dependency or
++        // deprecation note shows instead: the switch is locked then.
++        mod_details_panel->set_restart_note_visible(use_next_start_view() && !mod_details[mod_index].runtime_toggleable && !(auto_enabled || deprecated));
+         mod_entry_buttons[active_mod_index]->set_selected(true);
+     }
+ }
+@@ -644,9 +681,9 @@ void ModMenu::process_event(const Event &e) {
+             refresh_button->set_enabled(false);
+         }
+         if (active_mod_index != -1) {        
+-            bool auto_enabled = recomp::mods::is_mod_auto_enabled(mod_details[active_mod_index].mod_id);
++            bool auto_enabled = is_mod_required(mod_details[active_mod_index].mod_id);
+             bool deprecated = recomp::mods::is_mod_deprecated(mod_details[active_mod_index].mod_id, mod_details[active_mod_index].version);
+-            bool toggle_enabled = !auto_enabled && !deprecated && (mod_details[active_mod_index].runtime_toggleable || !ultramodern::is_game_started());
++            bool toggle_enabled = !auto_enabled && !deprecated && (mod_details[active_mod_index].runtime_toggleable || !ultramodern::is_game_started() || toggle_with_restart);
+             if (!toggle_enabled) {
+                 mod_details_panel->disable_toggle();
+             }
+@@ -733,6 +770,11 @@ ModMenu::ModMenu(ResourceId rid, Element *parent) : Element(rid, parent) {
+             mods_folder_button = context.create_element<Button>(footer_container, "Open Mods Folder", recompui::ButtonStyle::Tertiary);
+             mods_folder_button->add_pressed_callback([this](){ open_mods_folder(); });
+         } // footer_container
++#if defined(__PROSPERO__)
++        // PS5: no file dialog or file browser, and the game has started before this menu exists, so installing
++        // and rescanning are always off. Mods are added over FTP to the mods folder before a start.
++        footer_container->set_display(Display::None);
++#endif
+     } // this
+     
+     mod_entry_floating_view = context.create_element<ModEntryView>(this);
+@@ -766,6 +808,16 @@ void update_mod_list(bool scan_mods) {
+     }
+ }
+ 
++static std::atomic<bool> mod_list_stale{ false };
++
++void mark_mod_list_stale() {
++    mod_list_stale.store(true);
++}
++
++bool take_mod_list_stale() {
++    return mod_list_stale.exchange(false);
++}
++
+ void update_game_mod_id(const std::string &game_mod_id) {
+     current_game_mod_id = game_mod_id;
+ }
+diff --git a/recompui/src/config/ui_config.cpp b/recompui/src/config/ui_config.cpp
+index 6c84c05..a58476c 100644
+--- a/recompui/src/config/ui_config.cpp
++++ b/recompui/src/config/ui_config.cpp
+@@ -190,6 +190,11 @@ namespace recompui {
+             throw std::runtime_error("Config modal has not been initialized.");
+         }
+ 
++        // Switches changed from a prompt (pending mod changes cancelled) are redrawn before the menu shows.
++        if (recompui::take_mod_list_stale()) {
++            recompui::update_mod_list(false);
++        }
++
+         config_modal->open();
+     }
+ 
+diff --git a/recompui/src/config/ui_config_page_controls.cpp b/recompui/src/config/ui_config_page_controls.cpp
+index f379a6f..1280f1b 100644
+--- a/recompui/src/config/ui_config_page_controls.cpp
++++ b/recompui/src/config/ui_config_page_controls.cpp
+@@ -473,6 +473,7 @@ void ConfigPageControls::render_footer() {
+     {
+         auto footer_left = footer->get_left();
+         footer_left->clear_children();
++#if !defined(__PROSPERO__) // No keyboard on the PS5: only the controller mappings are shown.
+         if (!multiplayer_enabled) {
+             keyboard_toggle = context.create_element<IconToggle>(footer_left, "icons/Cont.svg", "icons/Keyboard.svg", ToggleSize::Large);
+             keyboard_toggle->set_checked(single_player_show_keyboard_mappings);
+@@ -481,6 +482,7 @@ void ConfigPageControls::render_footer() {
+                 this->update_control_mappings();
+             });
+         }
++#endif
+     }
+     {
+         auto footer_right = footer->get_right();
+diff --git a/recompui/src/config/ui_config_tab_general.cpp b/recompui/src/config/ui_config_tab_general.cpp
+index 296ce0e..9e4642d 100644
+--- a/recompui/src/config/ui_config_tab_general.cpp
++++ b/recompui/src/config/ui_config_tab_general.cpp
+@@ -68,13 +68,26 @@ namespace config {
+     }
+     
+     bool general::get_background_input_mode_enabled() {
++#if defined(__PROSPERO__)
++        // Hidden on the PS5: the title's window is offscreen and never has focus, so input must always be read.
++        return true;
++#else
+         return get_general_config_enum_value<BackgroundInputMode>(general::options::background_input_mode) == BackgroundInputMode::On;
++#endif
+     }
+     
+     bool general::get_debug_mode_enabled() {
+         return get_general_config_bool_value(general::options::debug_mode);
+     }
+ 
++#if defined(__PROSPERO__)
++    // PS5: the SDL joystick driver reports no motion sensors and there's no mouse, and the window never loses
++    // focus. Those options stay (the game reads gyro and mouse deltas every frame) but are hidden.
++    static constexpr bool ps5_hidden = true;
++#else
++    static constexpr bool ps5_hidden = false;
++#endif
++
+     recomp::config::Config &create_general_tab(const GeneralTabOptions& options, const std::string &name) {
+         created_general_config = true;
+         recomp::config::Config &config = recompui::config::create_config_tab(name, general::id, false);
+@@ -106,7 +119,8 @@ namespace config {
+                 "<br />"
+                 "<br />"
+                 "<b>Note: To recalibrate controller gyro, set the controller down on a still, flat surface for 5 seconds.</b>",
+-                25.0
++                25.0,
++                ps5_hidden
+             );
+         }
+ 
+@@ -118,7 +132,8 @@ namespace config {
+                 "<br />"
+                 "<br />"
+                 "<b>Note: This option does not allow mouse buttons to activate items. Mouse aiming is intended to be used with inputs that are mapped to mouse movement, such as gyro on Steam Deck.</b>",
+-                is_steam_deck() ? 50.0 : 0.0 // steam deck overrides default to 50%
++                is_steam_deck() ? 50.0 : 0.0, // steam deck overrides default to 50%
++                ps5_hidden
+             );
+         }
+ 
+@@ -136,7 +151,8 @@ namespace config {
+             "<br/>"
+             "<b>This setting does not affect keyboard input.</b>",
+             background_input_options,
+-            BackgroundInputMode::On
++            BackgroundInputMode::On,
++            ps5_hidden
+         );
+ 
+         return config;
+diff --git a/recompui/src/config/ui_config_tab_graphics.cpp b/recompui/src/config/ui_config_tab_graphics.cpp
+index 4fdf81f..9fa342a 100644
+--- a/recompui/src/config/ui_config_tab_graphics.cpp
++++ b/recompui/src/config/ui_config_tab_graphics.cpp
+@@ -2,6 +2,8 @@
+ #include "recompui/config.h"
+ #include "recompui/renderer.h"
+ #include "util/steam_deck.h"
++#include "util/file.h"
++#include "gui/rt64_performance_overlay.h"
+ 
+ static bool created_graphics_config = false;
+ 
+@@ -18,6 +20,14 @@ namespace recompui {
+             return is_steam_deck() ? ultramodern::renderer::WindowMode::Fullscreen : ultramodern::renderer::WindowMode::Windowed;
+         }
+ 
++#if defined(__PROSPERO__)
++        // PS5: options with nothing to set on the console (a window, downsampling, a manual refresh rate) are
++        // hidden, and their values fixed in apply_graphics_config.
++        static constexpr bool ps5_hidden = true;
++#else
++        static constexpr bool ps5_hidden = false;
++#endif
++
+         using EnumOptionVector = const std::vector<recomp::config::ConfigOptionEnumOption>;
+         static EnumOptionVector resolution_options = {
+             {ultramodern::renderer::Resolution::Original, "Original", "Original"},
+@@ -44,7 +54,7 @@ namespace recompui {
+         #if defined(_WIN32)
+         #define ALLOW_D3D12
+         #endif
+-        #if defined(_WIN32) || defined(__linux__)
++        #if defined(_WIN32) || defined(__linux__) || defined(__PROSPERO__)
+         #define ALLOW_VULKAN
+         #endif
+         #if defined(__APPLE__)
+@@ -78,9 +88,16 @@ namespace recompui {
+         };
+ 
+         static EnumOptionVector refresh_rate_options = {
++#if defined(__PROSPERO__)
++            // The console outputs a fixed 60 Hz: the game's own frames, or 60 with RT64's in-between frames
++            // (Manual at 60). A saved "Display" isn't an option here, so it loads as the default.
++            {ultramodern::renderer::RefreshRate::Original, "Original", "Original (30)"},
++            {ultramodern::renderer::RefreshRate::Manual, "Manual", "60"},
++#else
+             {ultramodern::renderer::RefreshRate::Original, "Original"},
+             {ultramodern::renderer::RefreshRate::Display, "Display"},
+             {ultramodern::renderer::RefreshRate::Manual, "Manual"},
++#endif
+         };
+ 
+         static EnumOptionVector hpfb_options = {
+@@ -89,6 +106,13 @@ namespace recompui {
+             {ultramodern::renderer::HighPrecisionFramebuffer::Off, "Off"},
+         };
+ 
++        static EnumOptionVector perf_overlay_options = {
++            {RT64::PerformanceOverlay::Mode::Off, "Off", "Off"},
++            {RT64::PerformanceOverlay::Mode::Fps, "FPS", "FPS"},
++            {RT64::PerformanceOverlay::Mode::FpsAndGraph, "FPSGraph", "FPS + Graph"},
++            {RT64::PerformanceOverlay::Mode::Detailed, "Detailed", "Detailed"},
++        };
++
+         static EnumOptionVector hud_ratio_mode_options = {
+             {ultramodern::renderer::HUDRatioMode::Original, "Original"},
+             {ultramodern::renderer::HUDRatioMode::Clamp16x9, "Clamp16x9", "16:9"},
+@@ -152,6 +176,15 @@ namespace recompui {
+         }
+ 
+         static std::string get_framerate_text(uint32_t refresh_rate) {
++#if defined(__PROSPERO__)
++            (void)refresh_rate;
++            return
++                "Sets the game's output framerate. This option does not affect gameplay."
++                "<br />"
++                "<br />"
++                "<recomp-color primary>Original (30)</recomp-color> shows only the frames the game draws. "
++                "<recomp-color primary>60</recomp-color> adds frames in between for smoother motion.";
++#else
+             return
+                 "Sets the game's output framerate. This option does not affect gameplay."
+                 "<br />"
+@@ -160,6 +193,7 @@ namespace recompui {
+                 "<br />"
+                 "<br />"
+                 "<recomp-color primary>Detected display refresh rate: " + std::to_string(refresh_rate) + "hz</recomp-color>";
++#endif
+         }
+ 
+         static void apply_graphics_config() {
+@@ -177,7 +211,17 @@ namespace recompui {
+ 
+             new_config.ds_option = get_graphics_enum_value<int>(graphics::options::ds_option);
+ 
++#if defined(__PROSPERO__)
++            // Hidden on the PS5: fixed, so a value saved before they were hidden can't apply unseen.
++            new_config.rr_manual_value = 60;
++            new_config.ds_option = static_cast<int>(DownsamplingOption::Off);
++#endif
++
+             ultramodern::renderer::set_graphics_config(new_config);
++
++            // The performance overlay is drawn by RT64's present thread, which reads these directly.
++            RT64::PerformanceOverlay::setFontPath(recompui::file::get_asset_path("InterVariable.ttf").string());
++            RT64::PerformanceOverlay::setMode(get_graphics_enum_value<RT64::PerformanceOverlay::Mode>(graphics::options::perf_overlay_option));
+         }
+ 
+         void graphics::update_msaa_supported(bool supported) {
+@@ -235,7 +279,11 @@ namespace recompui {
+             config.add_enum_option(
+                 graphics::options::res_option,
+                 "Resolution",
++#if defined(__PROSPERO__)
++                "Sets the output resolution of the game. <recomp-color primary>Original</recomp-color> matches the game's original 240p resolution. <recomp-color primary>Original 2x</recomp-color> will render at 480p. <recomp-color primary>Auto</recomp-color> renders at the console's output resolution (4K).",
++#else
+                 "Sets the output resolution of the game. <recomp-color primary>Original</recomp-color> matches the game's original 240p resolution. <recomp-color primary>Original 2x</recomp-color> will render at 480p. <recomp-color primary>Auto</recomp-color> will scale based on the game window's resolution.",
++#endif
+                 resolution_options,
+                 ultramodern::renderer::Resolution::Auto
+             );
+@@ -257,7 +305,8 @@ namespace recompui {
+                 "<br />"
+                 "Note: <recomp-color primary>4x</recomp-color> downsampling quality at <recomp-color primary>Original 2x</recomp-color> resolution may cause performance issues on low end devices, as it will cause the game to render <recomp-color warning>at almost 4k internal resolution</recomp-color>.",
+                 downsampling_options,
+-                DownsamplingOption::Off
++                DownsamplingOption::Off,
++                ps5_hidden
+             );
+             {
+                 config.add_option_change_callback(
+@@ -296,7 +345,8 @@ namespace recompui {
+                 "Window Mode",
+                 "Sets whether the game should display <recomp-color primary>Windowed</recomp-color> or <recomp-color primary>Fullscreen</recomp-color>. You can also use <recomp-color primary>F11</recomp-color> or <recomp-color primary>Alt + Enter</recomp-color> to toggle this option.",
+                 window_mode_options,
+-                wm_default()
++                wm_default(),
++                ps5_hidden
+             );
+ 
+             config.add_enum_option(
+@@ -304,14 +354,20 @@ namespace recompui {
+                 "Framerate",
+                 get_framerate_text(60),
+                 refresh_rate_options,
++#if defined(__PROSPERO__)
++                // The console's output is a fixed 60 Hz, which an offscreen SDL window can't report: set it.
++                ultramodern::renderer::RefreshRate::Manual
++#else
+                 ultramodern::renderer::RefreshRate::Display
++#endif
+             );
+ 
+             config.add_number_option(
+                 graphics::options::rr_manual_value,
+                 "",
+                 get_framerate_text(60),
+-                20.0, 240.0, 1.0, 0, false, 60.0
++                20.0, 240.0, 1.0, 0, false, 60.0,
++                ps5_hidden
+             );
+             {
+                 config.add_option_hidden_dependency(
+@@ -359,6 +415,15 @@ namespace recompui {
+                 true
+             );
+ 
++            config.add_enum_option(
++                graphics::options::perf_overlay_option,
++                "Performance Overlay",
++                "Shows the frame rate in the top right corner of the picture. <recomp-color primary>FPS + Graph</recomp-color> adds a graph of frame times, "
++                "and <recomp-color primary>Detailed</recomp-color> also shows frame time, the output resolution and memory use.",
++                perf_overlay_options,
++                RT64::PerformanceOverlay::Mode::Off
++            );
++
+             return config;
+         }
+     }
+diff --git a/recompui/src/config/ui_config_tab_mods.cpp b/recompui/src/config/ui_config_tab_mods.cpp
+index e982587..abe7b69 100644
+--- a/recompui/src/config/ui_config_tab_mods.cpp
++++ b/recompui/src/config/ui_config_tab_mods.cpp
+@@ -14,11 +14,54 @@ void config::create_mods_tab(const std::string &name) {
+         config::mods::id,
+         [](ContextId context, Element* parent) {
+             context.create_element<ModMenu>(parent);
++        },
++        // Can close
++        [](TabCloseContext close_context) {
++#if defined(__PROSPERO__)
++            // Code mod switches made while the game runs apply on the next start (ModMenu::mod_toggled): leaving
++            // the tab or closing the menu with any pending offers to close the game now, or to undo them.
++            const size_t changes = recomp::mods::count_next_start_changes();
++            if (changes > 0) {
++                recompui::open_choice_prompt(
++                    "Restart needed",
++                    std::string(changes == 1 ? "A mod change applies" : "Mod changes apply") +
++                        " the next time the game starts. Quit now to apply, or cancel the change" +
++                        (changes == 1 ? "" : "s") + "? Quitting loses any progress since your last save.",
++                    "Quit",
++                    "Cancel",
++                    []() {
++                        recomp::mods::apply_next_start_changes();
++                        ultramodern::quit();
++                    },
++                    [close_context]() {
++                        // Undo the changes and go back to the game. The switches can't be redrawn from here (the
++                        // prompt's context is open), so the list is refreshed when the menu next opens.
++                        (void)close_context;
++                        recomp::mods::discard_next_start_changes();
++                        recompui::mark_mod_list_stale();
++                        config::close();
++                    },
++                    recompui::ButtonStyle::Danger,
++                    recompui::ButtonStyle::Tertiary,
++                    true
++                );
++                return false;
++            }
++#else
++            (void)close_context;
++#endif
++            return true;
+         }
+     );
+ 
+     recompui::update_mod_list(false);
+ 
++#if defined(__PROSPERO__)
++    // No Find Mods tab on the PS5: this runs at start-up, before the game has started, so the check below doesn't
++    // skip it; and the title has no certificates for the store's HTTPS.
++    return;
++#endif
++
+     // Verify we actually SUPPORT mod discovery
+     if (!get_discovery_url().empty()) {
+         // We don't really want to deal with the risk of doing a mod reload/install while the game is running
+diff --git a/recompui/src/renderer/rt64_render_context.cpp b/recompui/src/renderer/rt64_render_context.cpp
+index a7954c7..2cb6206 100644
+--- a/recompui/src/renderer/rt64_render_context.cpp
++++ b/recompui/src/renderer/rt64_render_context.cpp
+@@ -225,7 +225,7 @@ renderer::RT64Context::RT64Context(uint8_t* rdram, ultramodern::renderer::Window
+     RT64::Application::Core appCore{};
+ #if defined(_WIN32)
+     appCore.window = window_handle.window;
+-#elif defined(__linux__) || defined(__ANDROID__)
++#elif defined(__linux__) || defined(__ANDROID__) || defined(__PROSPERO__)
+     appCore.window = window_handle;
+ #elif defined(__APPLE__)
+     appCore.window.window = window_handle.window;
+@@ -398,7 +398,12 @@ void renderer::RT64Context::enable_instant_present() {
+ }
+ 
+ uint32_t renderer::RT64Context::get_display_framerate() const {
++#if defined(__PROSPERO__)
++    // The console's display plane runs at 60 Hz; the swap chain (VK_KHR_display through plume) reports no rate.
++    return 60;
++#else
+     return app->presentQueue->ext.sharedResources->swapChainRate;
++#endif
+ }
+ 
+ float renderer::RT64Context::get_resolution_scale() const {
+diff --git a/recompui/src/renderer/ui_renderer.cpp b/recompui/src/renderer/ui_renderer.cpp
+index 556df18..1b19f7d 100644
+--- a/recompui/src/renderer/ui_renderer.cpp
++++ b/recompui/src/renderer/ui_renderer.cpp
+@@ -432,6 +432,9 @@ public:
+             texture_handle = texture_count_++;
+             texture_dimensions.x = 1;
+             texture_dimensions.y = 1;
++#if defined(__PROSPERO__)
++            fprintf(stderr, "[ui] image %s not queued yet: a placeholder until it is\n", source.c_str());
++#endif
+             Rml::byte transparent_pixel[] = { 0, 0, 0, 0 };
+             create_texture(texture_handle, transparent_pixel, Rml::Vector2i{ 1, 1 });
+             pending_texture_sources_[source] = texture_handle;
+@@ -467,8 +470,14 @@ public:
+         copy_command_queue_->waitForCommandFence(copy_command_fence_.get());
+ 
+         if (texture == nullptr) {
++#if defined(__PROSPERO__)
++            fprintf(stderr, "[ui] image %s couldn't be loaded\n", source.c_str());
++#endif
+             return false;
+         }
++#if defined(__PROSPERO__)
++        fprintf(stderr, "[ui] image %s loaded (%ux%u)\n", source.c_str(), texture->width, texture->height);
++#endif
+ 
+         texture_handle = texture_count_++;
+         texture_dimensions.x = texture->width;
+diff --git a/recompui/src/util/file.cpp b/recompui/src/util/file.cpp
+index 7ee84ed..1025648 100644
+--- a/recompui/src/util/file.cpp
++++ b/recompui/src/util/file.cpp
+@@ -59,10 +59,13 @@ namespace recompui {
+     }
+ 
+     std::filesystem::path file::get_app_folder_path() {
++#if !defined(__PROSPERO__)
+         // directly check for portable.txt (windows and native linux binary)
++        // Not on the PS5: a title has no working directory, and current_path() calls a getcwd that isn't there.
+         if (std::filesystem::exists("portable.txt")) {
+             return std::filesystem::current_path();
+         }
++#endif
+ 
+ #if defined(__APPLE__)
+         // Check for portable file in the directory containing the app bundle.
+@@ -83,6 +86,9 @@ namespace recompui {
+         }
+ 
+         CoTaskMemFree(known_path);
++#elif defined(__PROSPERO__)
++        // Settings, saves and the ROM copy live in the title folder.
++        recomp_dir = std::filesystem::path{"/app0"};
+ #elif defined(__linux__) || defined(__APPLE__)
+         // check for APP_FOLDER_PATH env var
+         if (getenv("APP_FOLDER_PATH") != nullptr) {
+@@ -119,6 +125,8 @@ namespace recompui {
+         return file::apple::get_bundle_resource_directory();
+ #elif defined(__linux__) && defined(RECOMP_FLATPAK)
+         return "/app/bin";
++#elif defined(__PROSPERO__)
++        return "/app0";
+ #else
+         return "";
+ #endif

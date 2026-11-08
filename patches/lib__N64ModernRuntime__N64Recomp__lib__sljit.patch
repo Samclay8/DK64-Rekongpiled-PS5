@@ -1,0 +1,71 @@
+diff --git a/sljit_src/allocator_src/sljitExecAllocatorPS5.c b/sljit_src/allocator_src/sljitExecAllocatorPS5.c
+new file mode 100644
+index 0000000..d3c3510
+--- /dev/null
++++ b/sljit_src/allocator_src/sljitExecAllocatorPS5.c
+@@ -0,0 +1,51 @@
++/*
++ *    Stack-less Just-In-Time compiler
++ *
++ *    PS5 chunk allocator (DK64 Recompiled PS5 port).
++ *
++ *    A PS5 title can't map memory executable: the kernel refuses execute asked for at map time. The
++ *    PS5 platform layer (ps5platform/exec.h in the payload SDK fork) maps direct memory read-write and
++ *    then adds execute, which the console allows (docs/PROBE.md there). Its regions are read, write and
++ *    execute at once, so sljit's write-xor-execute updates have nothing to do. Each chunk is placed
++ *    within +/-2 GiB of this code, so generated code reaches the title's functions with 32-bit
++ *    displacements.
++ *
++ *    The chunk core is sljit's own (sljitExecAllocatorCore.c).
++ */
++
++#include <stdio.h>
++#include <ps5platform/exec.h>
++
++static SLJIT_INLINE void* alloc_chunk(sljit_uw size)
++{
++	static int reported = 0;
++	void *chunk;
++
++	if (!reported) {
++		/* Written out before the call: if the console ends the process for it, this is the log's last line. */
++		fprintf(stderr, "[sljit] asking for executable memory (%lu bytes)\n", (unsigned long)size);
++		fflush(stderr);
++	}
++
++	chunk = ps5_exec_allocate(size, (uintptr_t)&alloc_chunk);
++
++	if (chunk == NULL) {
++		fprintf(stderr, "[sljit] no executable memory for a %lu byte chunk\n", (unsigned long)size);
++		fflush(stderr);
++	}
++	else if (!reported) {
++		reported = 1;
++		fprintf(stderr, "[sljit] executable memory for mod code at %p\n", chunk);
++		fflush(stderr);
++	}
++
++	return chunk;
++}
++
++static SLJIT_INLINE void free_chunk(void *chunk, sljit_uw size)
++{
++	SLJIT_UNUSED_ARG(size);
++	ps5_exec_release(chunk);
++}
++
++#include "sljitExecAllocatorCore.c"
+diff --git a/sljit_src/sljitLir.c b/sljit_src/sljitLir.c
+index ac726cc..eb7b31f 100644
+--- a/sljit_src/sljitLir.c
++++ b/sljit_src/sljitLir.c
+@@ -355,6 +355,9 @@
+ #include "allocator_src/sljitExecAllocatorWindows.c"
+ #elif defined(__APPLE__)
+ #include "allocator_src/sljitExecAllocatorApple.c"
++#elif defined(__PROSPERO__)
++/* Before __FreeBSD__, which the PS5 compiler also defines: a title can't map memory executable. */
++#include "allocator_src/sljitExecAllocatorPS5.c"
+ #elif defined(__FreeBSD__)
+ #include "allocator_src/sljitExecAllocatorFreeBSD.c"
+ #else
