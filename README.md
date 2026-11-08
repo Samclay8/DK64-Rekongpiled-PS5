@@ -76,8 +76,6 @@ on RecompExternalPython_API) can't load on the PS5.
 
 ## Known issues
 
-- ShadowMountPlus's "Installed" notification may name the game as "Unknown": the console looks up the title's
-  network ID, which homebrew doesn't have. The game itself is fine.
 - The DualSense is listed as two controllers in the controls menu. It doesn't affect play.
 
 ## Building
@@ -109,22 +107,6 @@ with a ROM, or with anything else from the game.
 | `patches/lib__RecompFrontend.patch` | Title folder paths, touchpad opens the menu, 60 Hz display, the Performance Overlay option (Graphics tab), a menu for the console: PlayStation button glyphs, Framerate as Original (30) or 60, and no options for a window, downsampling, mouse, gyro, background input or keyboard, or for installing mods from the menu, and no Find Mods tab; UI image loads in the log |
 | `ps5/` | Start-up, log and crash reports, relative paths, libc shims (including curl's and OpenSSL's), title linking |
 | `mods/` | The built-in mods, embedded at configure time |
-
-### Home screen art
-
-The title shows as DK64 Rekongpiled (`sce_sys/param.json`). The icon, the home screen background (`pic0`), the
-splash while the game starts (`pic1`) and the ROM screen's background come from one AI-generated picture,
-`assets/background-source.webp`, with DK64: Recompiled's logo: `tools/make-art.py` makes them, and
-`tools/make-backgrounds.py` converts the background and splash to the console's DDS files. Both need a venv
-(`python3 -m venv .venv && .venv/bin/pip install pillow etcpak resvg-py`):
-
-```sh
-.venv/bin/python tools/make-art.py src-upstream/assets assets/background-source.webp build-art
-.venv/bin/python tools/make-backgrounds.py build-art/background.png build-art/splash.png sce_sys
-```
-
-ShadowMountPlus copies the art when it registers the title. After changing it, replace it in
-`/user/appmeta/PPSA64064/` as well, then restart ShadowMountPlus or the console.
 
 ## Licences and credits
 
